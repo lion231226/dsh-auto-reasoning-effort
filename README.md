@@ -1,311 +1,345 @@
-# dsh-thinking-levels
+# dsh-auto-reasoning-effort
 
-**Per-round thinking-level (`reasoning_effort`) control for [DeepSeek Harness (dsh)](https://github.com/deepseek-ai/deepseek-harness): pick `Auto` (a mask) in the session model selector and the plugin schedules `low` / `high` / `max` from the recent tool-call history before submitting the API effort — or fix a wire level (`off` / `on` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max`) manually. Cheap tool rounds stay cheap; heavy work never starves.**
+**Difficulty-driven reasoning effort for [DeepSeek Harness (dsh)](https://github.com/deepseek-ai/deepseek-harness).**
 
-- [English README](./README.md)
-> **v0.7.0-beta.1 (2026-09-06): the short-circuit route is retired.** This release no longer depends on `dsh-llm-openai-completions` — custom-gateway fixes ride the official `llm-pi-ai` compat surface (requires **dsh ≥ v0.1.2-alpha.1**); keep the adapter plugin uninstalled. See the [CHANGELOG](./CHANGELOG.md).
+Pick **Auto** in the session model selector and the plugin chooses a `reasoning_effort` wire level —
+`low`, `high` or `max` — for *this* request, based on how hard the current task actually looks: the
+prompt you just sent, plus the tool activity of the current turn. A one-line lookup stays cheap; a
+refactor with a stack trace gets the heavy setting. You can still pin any wire level by hand.
 
 - [中文 README](./README.zh.md)
-- [日本語 README](./README.ja.md)
-- [한국어 README](./README.ko.md)
-- [README en français](./README.fr.md)
-- [Deutsche README](./README.de.md)
-- [README in italiano](./README.it.md)
-- [README на русском](./README.ru.md)
-- [README en español](./README.es.md)
-- [Installation guide](./INSTALL.md)
-- [中文安装指南](./INSTALL.zh.md)
-- [日本語インストールガイド](./INSTALL.ja.md)
-- [한국어 설치 안내](./INSTALL.ko.md)
-- [Guide d'installation en français](./INSTALL.fr.md)
-- [Installationsanleitung auf Deutsch](./INSTALL.de.md)
-- [Guida all'installazione in italiano](./INSTALL.it.md)
-- [Руководство по установке на русском](./INSTALL.ru.md)
-- [Guía de instalación en español](./INSTALL.es.md)
+- [Installation guide](./INSTALL.md) · [中文安装指南](./INSTALL.zh.md)
 - [Changelog](./CHANGELOG.md)
-- [日本語 changelog](./CHANGELOG.ja.md)
-- [한국어 changelog](./CHANGELOG.ko.md)
-- [Changelog en français](./CHANGELOG.fr.md)
-- [Changelog auf Deutsch](./CHANGELOG.de.md)
-- [Changelog in italiano](./CHANGELOG.it.md)
-- [Список изменений на русском](./CHANGELOG.ru.md)
-- [Changelog en español](./CHANGELOG.es.md)
 
-> **▼ DSH version support**
->
-> This release (4.3.x) pins DSH hosts by the exact 14-term enumeration `0.1.0-rc.8 || 0.1.1-rc.1 || 0.1.1-rc.2 || 0.1.2-rc.1 || 0.1.5-rc.1 || 0.1.5-rc.2 || 0.1.5-rc.3 || 0.1.7-rc.1 || 0.1.7-rc.2 || 0.2.0-rc.1 || 0.2.0-rc.2 || 0.2.1-rc.1 || 0.2.1-rc.2 || 0.2.1-rc.3` — each rc listed individually, no ranges or carets; 0.2.1 stable is not declared until it ships.
->
-> | DSH version | Status | Notes |
-> | --- | --- | --- |
-> | ≥ 0.2.0-rc.1 | ✅ Supported | This release (4.0.x): same declarative settings surface (`.volatile()` schema fields rendered by the host; cross-plugin reads/writes through the `configForms` service), with the peer gate retargeted to the 0.2.0-rc segment |
-> | ≥ 0.1.7-rc.1 to < 0.2.0 | ✅ Supported | Use the 3.x line (3.4.3, npm dist-tag `dsh-0.1.7`): declarative settings — the host renders the Plugins form from the plugin's `.volatile()` schema fields; cross-plugin reads/writes go through the `configForms` service |
-> | < 0.1.7-rc.1 | ⚠️ Not supported | DSH 0.1.7 removed the imperative settings registration and the per-plugin card seat the earlier lines (3.0.x and below) relied on — stay on plugin 3.0.2 for 0.1.2–0.1.6 hosts. |
->
-> The boundary is `0.1.7-rc.1`, where DSH removed the imperative settings registration (`settings.register` / `installSettingsSection`) and the client `settingsScope` service. Since that boundary the runtime-adjustable config fields are marked `.volatile()` in the schemastery schema, the host generates the settings form from that schema alone (no registration call, no client settings card), and the plugin reads the live values per request, driven by `loader/volatile-update`. The 3.1.x–3.4.x lines target the 0.1.7 declarative surface; the 4.0.x line is the same surface retargeted to the 0.2.0-rc segment.
+> **A fork, not a rename.** This project starts from
+> [`dsh-thinking-levels` 4.4.8](https://github.com/drscrewdriver/dsh-thinking-levels) (MIT,
+> © 2026 drscrewdriver) and replaces its scheduling signal: upstream schedules from the session-wide
+> tool-call history, this fork classifies the **task's difficulty** first and uses tool activity only
+> as a correction. Upstream copyright is preserved — see [LICENSE](./LICENSE) and [NOTICE](./NOTICE).
 
-> **Version-range policy:** every compatibility line pins its host segment tightly. Lines targeting 0.1.x hosts follow `>=0.1.x-rc.1 <0.1.(x+1)-0` (3.1.x: `>=0.1.7-rc.1 <0.1.8-0`; 3.0.x: `>=0.1.5-alpha.1 <0.1.6-0`; 2.0.x: `>=0.1.2-alpha.1 <0.1.3-0`; 1.0.0-beta: `>=0.1.0-rc.8 <0.1.2-alpha.1`); lines targeting the 0.2.x segment follow `>=0.2.0-rc.1 <0.2.1-0` (4.0.x: `>=0.2.0-rc.1 <0.2.1-0`). No line ever declares an open upper bound, so a compatibility resolver can never match a plugin line against a newer host segment it was not built for. 0.4.0–0.6.0 carried no dsh peer declarations at all and are effectively compatibility-untyped — do not install them. Since the 4.2.x multi-line era, the 4.x line pins hosts with the exact per-rc enumeration above instead of a segment range — the range formulas describe the historical per-segment lines.
+## Why bother
 
-> **Compatibility note:** Version `0.6.0` includes Japanese (`ja`) and Korean (`ko`) dictionaries and selector entries, but the current official DSH releases expose only `zh` and `en` through `LocaleRuntime`. On stock DSH, selecting `ja` or `ko` fails with `locale "<id>" is not registered`. These languages will work after official DSH adds the locale IDs. Advanced users can use a DSH fork that updates `packages/client/locale/src/locale-settings.ts` (`LOCALE_IDS`) and `packages/client/locale/src/client/index.ts` (`LOCALES` labels), together with the corresponding core dictionaries and tests, then rebuild and run the forked DSH. Changing this plugin alone cannot extend DSH's global locale list.
+In a multi-step agent run the model re-thinks before every tool call, and that thinking phase
+dominates wall-clock time. A fixed `high` wastes minutes on `cat package.json`; a fixed `low`
+under-thinks a migration. The useful signal is not "how many tools ran" but "how hard is what the
+user is asking". This plugin makes that the primary input.
 
-In a multi-step tool chain, the model re-thinks before **every** tool call — and that thinking dominates the wall-clock time (a 50-step agent task can spend minutes reasoning between tools). `dsh-thinking-levels` plugs into the `agent/request` waterfall that dsh re-resolves for every step (registered with `prepend` so the session model-selection assembly cannot overwrite its decision) and injects a thinking level into the next model request.
+## What it does
 
-## Preview
+On every `agent/request` the plugin:
 
-Screenshots of the live UI (dsh web):
+1. takes the latest user message of the current turn and classifies its difficulty
+   (`trivial` / `simple` / `moderate` / `complex`, plus an explicit override),
+2. maps the difficulty to a base level (`low` / `high` / `max`),
+3. optionally nudges it by this turn's tool samples (only when the turn has at least two samples),
+4. applies hysteresis so the level does not flap between requests,
+5. clamps to a level the model actually advertises — preferring the nearest **lower** one,
+6. injects the result as `reasoningEffort`, and logs the decision with its reasons.
 
-<figure>
-  <img width="460" alt="Model selector Auto dropdown injected by the plugin: levels Off / Low / High / Max / Auto, High currently selected, Auto highlighted — Auto is a mask, the plugin schedules low/high/max per step from the tool history." src="assets/官方模型的自动级别调整.png" />
-  <figcaption>Native model selector gains <strong>Auto</strong> — pick it and the plugin schedules low/high/max per step instead of a fixed wire level.</figcaption>
-</figure>
+If a manual level was chosen (in the model selector, in the plugin's `level` config, or by an
+`[effort: …]` marker in the message), that wins and the scheduler is skipped.
 
-<figure>
-  <img style="max-width:100%" alt="Thinking-level settings (3.0.x card shown): default level (auto scheduling), enable / allow-downgrade / allow-upgrade toggles, llm-pi-ai custom-provider model-capability table with the progressive per-model editor, and apply-to-all presets (Off/High/Max official DeepSeek style, Off/Low/Medium/High generic)." src="assets/自动思考级别配置.png" />
-  <figcaption>Thinking-level settings, 3.0.x card (screenshot kept for reference). Since 3.1.0 / DSH 0.1.7 the level, enable and scheduler toggles render as a host-generated declarative form; the custom card and its llm-pi-ai capability editor were removed with the retired seat.</figcaption>
-</figure>
+## Relationship to upstream `dsh-thinking-levels`
 
-<figure>
-  <img style="max-width:100%" alt="Per-model capability editor for a custom openai-completions model (local-35b / Qwen3.6-35B-A3B), as shipped in the 3.0.x settings card: thinking model and vision enabled, support think effort off, thinking format qwen-chat-template (auto-filled); no takeover switch — the official compat flag lives on the provider row; context-window limit presets 64K/128K/256K/400K/512K/1M with a custom input." src="assets/自定义模型的思考接管-短路-上下文窗口限制.png" />
-  <figcaption>Per-model capability card, 3.0.x (screenshot kept for reference). Since 3.1.0 / DSH 0.1.7 the capability editor ships no more; edit `llm-pi-ai` model capabilities through the official Models settings instead.</figcaption>
-</figure>
+This repository is a fork of
+[`drscrewdriver/dsh-thinking-levels` 4.4.8](https://github.com/drscrewdriver/dsh-thinking-levels)
+(MIT, © 2026 drscrewdriver), not a continuation of its release line. The upstream MIT text is kept
+verbatim in [LICENSE](./LICENSE) with our copyright line appended, and [NOTICE](./NOTICE) spells out
+which files are upstream work and which are ours. Upstream history through 4.4.8 stays in the
+[upstream changelog](https://github.com/drscrewdriver/dsh-thinking-levels/blob/main/CHANGELOG.md).
 
-## Levels
+What changed is the scheduling semantics: upstream schedules from the session-wide tool history and
+leaves the rest of the pipeline alone; we classify the task's difficulty first, demote tool history
+to a correction, and land the eight fixes listed below. The client UI, the settings/volatile-config
+plumbing and the takeover/pricing helpers are upstream work, carried over unchanged.
 
-| Level | Meaning | Where |
+Thanks to drscrewdriver for the original plugin.
+
+## How it differs from dsh-thinking-levels
+
+| | `dsh-thinking-levels` 4.4.8 (upstream) | `dsh-auto-reasoning-effort` (this fork) |
 |---|---|---|
-| `off` | thinking disabled (manual only — never auto-picked) | model selector / default level |
-| `on` | thinking enabled (toggle-only models only): sends `enable_thinking`, never a think effort | model selector / default level |
-| `minimal` | least effort (very light tasks) | model selector / default level |
-| `low` | manual pick for simple chat tasks (cheap rounds stay cheap) | model selector / default level |
-| `medium` | medium effort | model selector / default level |
-| `high` | the official default effort | model selector / default level |
-| `xhigh` | extra high effort | model selector / default level |
-| `max` | heavy work | model selector / default level |
-| `auto` | **mask**: schedule per step from the recent tool-call history, resolved to a wire level before submission | model selector (injected by the plugin) / default level |
+| Primary signal | session-wide tool-call history | difficulty of the current prompt (length, keywords, structure, errors) |
+| Sample window | one ring buffer for the whole session | isolated per turn; a new prompt clears the window |
+| Failure behavior | falls back to a low level | falls back to `high` (`safeFallback`), never silently cheapens the task |
+| Unsupported level | clamps to the highest advertised level | clamps to the nearest **lower** advertised level |
+| Flapping | no damping | `hysteresisSteps` (default 2): the level moves only after N consecutive identical decisions |
+| Simple tool matcher | Unix-flavored names | adds `pwsh`, `shell`, `powershell`, `apply_patch` |
+| Custom wire ids (`ultra`, …) | can be swallowed by clamping | preserved when the model advertises them |
+| Explainability | level only | `reasons[]` per decision (e.g. `len:812`, `kw:重构`, `stack-trace`) |
 
-Wire-level facts (verified against the official DeepSeek docs and dsh's `llm-deepseek` adapter): `low` maps 1:1 on deepseek-v4-flash / v4-pro, while `medium` / `xhigh` collapse onto `high`. The adapter accepts `off | low | high | max` and rejects anything else with `UNSUPPORTED_REASONING_EFFORT` — `auto` is the plugin's mask layer, never sent to the API, always resolved to a concrete wire level before injection. `on` is **not** an effort level: it is advertised only by toggle-only models (Qwen3.6-style), and it only flips `enable_thinking` true — no `reasoning_effort` is sent; an effort-capable model never advertises `on`, so a manual `on` pick on one is stripped.
+## Installation
 
-## Custom wire mapping
+Requirements: Node.js 22.19+ (or 24+), a DSH build from the peer range declared in
+`package.json` (the 14 rc terms up to `0.2.1-rc.3`), and the `dsh` CLI (pnpm 11 ships with it).
 
-For hand-declared `llm-pi-ai` models, map each level to the exact value your gateway expects (borrowed from dsh-thinking-effort): tick a level and enter its wire value, e.g. `high` → `ultra`. The mapping is stored as the model's `reasoningEfforts` table in the `llm-pi-ai` config, so the Composer selection `High` sends `ultra` to the gateway. Leaving `off` empty means "do not send".
-
-- Official preset: `Off / High / Max` (official DeepSeek style)
-- Generic preset: `Off / Low / Medium / High`
-
-> The visual editor for this mapping rode the plugin's settings card, which the DSH 0.1.7 migration removed (the seat no longer exists). Edit the `reasoningEfforts` table through the official Models settings surface instead — the host-side detection and injection read it live either way.
-
-## Effort slider (per model line)
-
-The model panel's per-line effort `<select>` became a **segment slider**: click a line's effort chip (it shows the effective level, or *Provider default*) and a full-width slider expands under that line. The stop count adapts to what the model advertises — two-stop toggle-only models, the official `off/low/high/max` set, custom gateway wire values; `auto` (when the directory carries the mask) is pinned **leftmost**, then `off`/`on`, then the strength gradient, unknown wire values last.
-
-Since 4.4.0 the selector's own effort chip shows the **user intent**, not the scheduler's resolved level: with the intent `auto` the main label stays **Auto** and the level actually sent in the last step is demoted to a secondary hint (`→ low`). Note: while the model-UI takeover below is off, the *official* selector's chip keeps showing the last resolved level — that is host projection semantics the plugin cannot restyle.
-
-Interaction follows the approved dsh-reasoning-effort visual baseline: the thumb follows the pointer continuously and **snaps on release** (one route write per gesture), the plain thumb is pure white in every theme, the thumb stays fully visible at both endpoints, and ←/→/Home/End step stop-by-stop. The select's *Provider default* reset survives as the ↺ button of the slider row.
-
-DeepSeek lines (the official route, or any gateway model whose id/name says deepseek) run the **whale-girl runner** as the thumb: an 8-frame side-run strip, ping-pong looped (720 ms per direction at rest, 420 ms while dragging), frozen under `prefers-reduced-motion`. Every other model gets the plain knob.
-
-## Model UI takeover (since 4.4.0)
-
-New setting `takeoverUi` (default **off**): the plugin no longer replaces the composer's model popup — search, grouping and loading stay with the shipped selector, and the `auto` mask still arrives through the server-side advertisement; official-model context editing lives on the settings card. Turning it on restores the ModelPanel takeover (per-line editors + popup search). Changes apply immediately — no reload needed.
-
-The strip is community whale-girl artwork sourced from [HanaAyane/dsh-reasoning-effort](https://github.com/HanaAyane/dsh-reasoning-effort) (`assets/chibi-runner-strip.png`); regenerate the inlined asset with `python tools/whale-mascot.py`.
-
-## Context-window presets
-
-The composer tool-row quick control (next to the model/effort select) edits a **context window limit**: preset stops `64K / 128K / 256K / 400K / 512K / 1M`, a custom integer input, and a clear button. The value is written to the `llm-pi-ai` model entry `contextWindow` (integer `2000`–`1000000`) — or to the `llm-deepseek` entry for official DeepSeek models.
-
-Upstream, the harness consumes it through `resolveModelInfo(...).context.contextWindow` for compaction thresholds, context-overflow detection and context-pressure projections. Because `llm-pi-ai` re-reads the live config on every resolve and the compat sync does not block model discovery, a settings edit takes effect on the next request without a restart.
-
-The plugin config also accepts `models['provider/model'].contextWindow` as a validated (integer `2000`–`1000000`) declaration at the composition/config surface.
-
-## Model-aware guard (v0.5.0)
-
-The plugin never sends a `reasoning_effort` to a model that does not advertise one. Custom
-openai-completions routes (e.g. a local Qwen3.6 without `reasoningEfforts`) are classified
-non-reasoning via `ctx.llm.resolveModelInfo`, and any effort — inherited or scheduled — is
-**stripped** instead of sent, so dsh's per-request `UNSUPPORTED_REASONING_EFFORT` rejection
-cannot fire. Unsupported fields are never passed to an API that cannot take them.
-
-Version behavior:
-
-| dsh version | `low` handling |
-|---|---|
-| rc.6 (old) | not native: the selector only shows it when a configurer-confirmed `models` override names it; the level is then advertised (selector + request validation) and passed through verbatim |
-| rc.7+ (new) | native: the plugin neither rewrites nor re-injects it; a manual `low` pick passes through unchanged |
-
-The auto scheduler may still pick `low` for supporting models — the capability guard above is
-what keeps it away from models that cannot take it.
-
-## Model-selector Auto
-
-The session model selector (next to the model) now offers **Auto** after the wire levels (injected into the model-directory metadata by the plugin):
-
-| Model-selector pick | Behavior |
-|---|---|
-| **Auto** | plugin schedules via tool history + the upgrade/downgrade toggles, resolves to `low` / `high` / `max` before submission |
-| `off` / `on` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max` | **manual choice wins** — plugin does not intervene (`on` stays `on` on toggle-only models, never lifted to an effort; effort-capable models strip it) |
-| unset | the plugin's default level applies (below) |
-
-## Auto scheduler
-
-The hub is `high` (the official default). `auto` schedules between `low` / `high` / `max`; it never picks `off`.
-
-| Recent tool calls | Level |
-|---|---|
-| none (fresh prompt, pure chat) | `low` |
-| ≥75% simple tools, small args, downgrades allowed | `low` |
-| mixed / heavy tools | `high` |
-| very heavy payloads, upgrades allowed | `max` |
-
-The scheduling policy is the same source as [dsh-tool-turbo](https://github.com/drscrewdriver/dsh-tool-turbo) (same simple-tool whitelist / payload thresholds / 75% ratio rule).
-
-**Where the samples come from (4.4.7+).** The scheduler folds `tool/call` events into a Session projection (`tlAutoSchedule`), so it sees real tool history on every host from 0.1.2-rc.1 on; the pre-4.4.7 `session.events` read only ever produced samples on 0.1.0-rc.8. The session's explicit pick is folded from `model/selection` events, so a level the host echoes back can never be mistaken for a manual choice. Known limitation: host `0.1.0-rc.8` exposes no `stateOf` on its projection registry (legacy plane contract), so that one line keeps the old array read — scheduling works there, the echo correction does not.
-
-## Install
-
-See [INSTALL.md](./INSTALL.md) for the full official-CLI guide (profile discovery, upgrade, migration, verification, troubleshooting). Quick start:
+**1. From GitHub (source; runs the build through `prepare`)**
 
 ```bash
-# 1. install the plugin into a profile from npm (web shown; any profile works)
-#    (the web profile is a pnpm workspace root, so -w is required)
-dsh plugin --profile web add dsh-thinking-levels -w
-#    GitHub alternative:
-#    dsh plugin --profile web add https://github.com/drscrewdriver/dsh-thinking-levels.git -w
-#    local-path alternative (no network needed):
-#    dsh plugin --profile web add /absolute/path/to/dsh-thinking-levels
+dsh plugin --profile web add github:lion231226/dsh-auto-reasoning-effort
+```
 
-# 2. restart dsh web (a running instance does not hot-load new bundle layers)
+**2. From npm (prebuilt `lib/`, no build step)**
+
+```bash
+dsh plugin --profile web add dsh-auto-reasoning-effort
+```
+
+**3. From dsh-market (GUI)**
+
+Open the dsh-market plugin browser, search `dsh-auto-reasoning-effort` and install it. If the
+entry is not listed yet, use one of the CLI channels above.
+
+Then restart the host — a running `dsh web` process does not hot-load a new bundle layer:
+
+```bash
 dsh web
 ```
 
-> Note: the dsh runtime uses pnpm 11, whose `minimumReleaseAge` supply-chain policy may block a
-> freshly published version with `ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION` — add the version to
-> `minimumReleaseAgeExclude` in `~/.dsh/profiles/web/pnpm-workspace.yaml` to lift the cooling period.
+Notes that save time:
 
-Manual `link:` registration (alternative to `dsh plugin add`):
+- The **web** profile is a pnpm workspace root; if `dsh plugin add` complains about the workspace,
+  append `-w` to the command.
+- A GitHub install executes the package's `prepare` script. pnpm ≥ 10 blocks dependency build
+  scripts by default and asks you to approve `dsh-auto-reasoning-effort` in the profile's
+  `pnpm-workspace.yaml` (`allowBuilds`). Install from npm or a packed tarball if you would rather not
+  grant that.
+- The composition row and the npm package share the name `dsh-auto-reasoning-effort`; a profile
+  override targets the row id `dsh-auto-reasoning-effort`.
+- Remove an installed `dsh-thinking-levels` before installing this one — two schedulers writing
+  `reasoningEffort` on the same request will fight.
 
-```bash
-#    ~/.dsh/profiles/web/package.json dependencies:
-#      "dsh-thinking-levels": "link:<absolute path to dsh-thinking-levels>"
-#    ~/.dsh/profiles/web/cordis.patch.yml:
-#      - insert:
-#          - id: thinking-levels
-#            name: dsh-thinking-levels
-cd ~/.dsh/profiles/web && pnpm install && dsh web
-```
+Full prerequisites, verification and troubleshooting: [INSTALL.md](./INSTALL.md).
 
 ## Configuration
 
-Two surfaces share one schema:
+Two surfaces share one schema: the plugin row's `config:` in the profile composition
+(`cordis.yml`), and the Settings → Plugins form generated from the plugin's `.volatile()` schema
+fields (`enabled`, `level`, `allowDowngrade`, `allowUpgrade`, `hysteresisSteps`, `safeFallback`) —
+those apply to the next request without a restart. Keyword lists and `models` are configurer-level:
+edit the composition.
 
-- **Assembly** — the plugin row's `config:` in the profile composition (e.g. `cordis.yml`):
-  ```yaml
-  config:
-    level: auto            # off | on | minimal | low | medium | high | xhigh | max | auto — the default level when the session picks nothing
-    allowDowngrade: true   # let the scheduler drop below `high`
-    allowUpgrade: false    # forbid the scheduler lifting to `max`
-  ```
-- **Runtime** — the plugin's `.volatile()` config fields (`enabled`, `level`, `allowDowngrade`, `allowUpgrade`): DSH 0.1.7 renders the Plugins settings form from the declared schema, and committed changes reach the plugin as live config references (`loader/volatile-update`) — they apply to the next model request, no restart needed. (`models` stays a configurer-level field: edit it in the profile composition.)
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `enabled` | boolean | `true` | Master switch. When off, the plugin injects nothing. |
+| `level` | `off` \| `on` \| `minimal` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` \| `auto` | `auto` | Default level when the session picks nothing. `auto` means "schedule per request". |
+| `allowDowngrade` | boolean | `true` | Let the scheduler pick `low` when the task is easy or the turn is dominated by simple tools. |
+| `allowUpgrade` | boolean | `false` | Let the scheduler pick `max` for `complex` tasks and heavy tool payloads. Off caps complex work at `high`. |
+| `hysteresisSteps` | integer 1–10 | `2` | Number of consecutive identical decisions required before the wire level actually moves. `1` disables damping. |
+| `safeFallback` | `low` \| `high` \| `max` | `high` | Level used when the session projection cannot be read or the difficulty input fails to parse. |
+| `difficulty.complexKeywords` | string[] | see below | A hit raises the score to at least `0.55`, then adds `+0.10`. |
+| `difficulty.heavyKeywords` | string[] | see below | A hit adds `+0.10`. |
+| `difficulty.simpleKeywords` | string[] | see below | A hit multiplies the score by `0.7`. |
+| `difficulty.trivialKeywords` | string[] | see below | A hit with `len < 60` sets the score to `min(score × 0.3, 0.2)`. |
+| `models` | map | `{}` | Per-model capability overrides keyed `provider/model`; each entry may set `vision`, `thinking`, `efforts` (`false` or a level array) and `contextWindow`. |
 
-Per-model capability overrides (`models`, keyed `provider/model`) confirm what auto-detection
-finds; the configurer has the final word:
+Keyword defaults:
+
+```yaml
+complexKeywords: [重构, 架构, 设计, 调试, 排查, 迁移, 性能, 并发, 安全,
+                  refactor, design, debug, migrate, optimize, rewrite,
+                  从零, from scratch, 实现, implement]
+heavyKeywords:   [全部, 整个, 全量, 端到端, complete, entire, whole, all, full, end-to-end]
+simpleKeywords:  [读, 查, 看, 列, 搜, 找, 读取, 显示, read, show, list, print, cat]
+trivialKeywords: [谢谢, 好的, 收到, 明白, ok, okay, thanks, 继续, 接着, next, continue]
+```
+
+Example composition:
 
 ```yaml
 config:
   level: auto
-  models:
-    llm-pi-ai/Qwen3.6-35B-A3B:   # non-reasoning thinking model (thinking toggle + budget)
-      vision: false
-      thinking: true
-      efforts: false             # never send reasoning_effort (stripped at request time)
-    llm-pi-ai/Qwen3.8-27B:       # effort-capable model (rc.6-era adapter without low)
-      efforts: [low, high]       # confirm low → advertised in the selector + passed through
+  allowDowngrade: true
+  allowUpgrade: true          # allow `max` on complex tasks
+  hysteresisSteps: 2
+  safeFallback: high
+  difficulty:
+    complexKeywords: [重构, 架构, refactor, 从零, implement]
 ```
 
-> For Qwen thinking on/off + budget, configure the **llm-pi-ai** route instead:
-> `compat.thinkingFormat: qwen` (→ wire `enable_thinking` + `thinking_budget` via
-> `thinkingBudgets`), or `qwen-chat-template` (→ `chat_template_kwargs.enable_thinking`) for
-> effort models like Qwen3.8-27B.
+The upstream fields `takeover`, `takeoverUi` and `defaultPricing` are retained unchanged; they are
+orthogonal to scheduling and documented by the upstream project.
 
-Defaults: `{ enabled: true, level: 'auto', allowDowngrade: true, allowUpgrade: false, models: {} }`.
+### Manual override
 
-> Semantics: the model-selector pick outranks the plugin's default level. Pick `auto` (mask) → plugin schedules; pick a wire level → applied directly; pick nothing → the plugin's `level` default is used. `allowDowngrade` / `allowUpgrade` constrain `auto` scheduling only.
+The model-selector pick always outranks the scheduler: choose `off`, `on`, `minimal`, `low`,
+`medium`, `high`, `xhigh` or `max` and that wire level is used as-is. A single message can also
+force a level — write `[effort: low]`, `[effort: high]` or `[effort: max]` (brackets optional,
+case-insensitive) and that request bypasses difficulty classification.
 
-## Third-party transport takeover (three protocols)
+## Difficulty algorithm
 
-The settings card's **Third-party takeover** switch (「第三方接管」) adds a route to the
-`dsh-llm-openai-completions` transport's `providers` list. **The transport's name is
-legacy** — since the 4.4.x line it fronts three wire protocols, not just
-`openai-completions`: `openai-completions`, `openai-responses` and `anthropic`. When a
-route is taken over, its model requests are short-circuited through that transport
-(multimodal true-send, modality gate, prompt injection) and `llm-pi-ai` steps out.
+### Inputs
 
-The per-level wire editor (`reasoningEfforts`) is **protocol-neutral** since 4.4.4: the
-host turns the table into pi-ai's `thinkingLevelMap`, which every protocol reads
-(Anthropic thinking budget, Responses reasoning effort, completions `reasoning_effort`
-string). The two completions-only compat switches (`支持 think effort` / `思考格式`)
-render *only* on `openai-completions` routes — elsewhere the host rejects them at write
-time, so they are absent from the DOM.
+| Input | Source | Notes |
+|---|---|---|
+| `message` | latest user message of the current turn | truncated to 4000 chars; text parts concatenated |
+| `attachments` | current turn | count only — attachment contents are not read |
+| `priorErrors` | current turn's tool results | tool results carrying `error` / `isError` |
+| `toolCount` | current turn | all tool calls, not just the sampled window |
 
-> **Toggle-folding caveat (fixed in 4.4.5).** The Off/On collapse of a thinking model's selector is an
-> `openai-completions`-only behavior: it fires when a route is taken over **and** the
-> model carries a `reasoningEfforts` table **without** `compat.supportsReasoningEffort: true`.
-> That fold exists because pi-ai rejects a `reasoning_effort` string outside its fixed seven
-> levels — a completions-wire concern. On a Responses/Anthropic route the levels map natively
-> (thinking budget / reasoning-effort enum) and `supportsReasoningEffort` cannot be written at
-> all, so through 4.4.4 taking such a route over wrongly folded a multi-level table to Off/On.
-> Since 4.4.5 the fold additionally requires the route's `api` to be `openai-completions` (or
-> absent), so a taken-over Responses/Anthropic route keeps its full level set end to end.
+### Step 1 — explicit marker wins
 
-## Official compat surface: the short-circuit tool is retired (0.7.0-beta.1)
+If the message matches a bracketed `effort` marker — `[effort: high]`, `{effort=max}`, `【EFFORT =
+low】` — with one of `off`, `low`, `high`, `max`, the classification stops immediately with difficulty
+`explicit`, score `1.0` and the requested level.
 
-Once custom gateways (vLLM / LM Studio / self-hosted OpenAI-compatible proxies) declare
-thinking, this plugin writes the fixes into the **official `llm-pi-ai` compat surface**
-(introduced in dsh ≥ **v0.1.0-rc.8**, commit `884f7b9c41`) —
-[dsh-llm-openai-completions](https://github.com/drscrewdriver/dsh-llm-openai-completions)
-is no longer needed for the developer-role fix and should stay uninstalled unless you
-explicitly want its three-protocol takeover (see above):
+### Step 2 — base score from message length
 
-- Scans `llm-pi-ai.providers` for routes that are custom gateways **and** declare a
-  `reasoningEfforts` table on any model (including `modelOverrides`), then writes:
-  - route-level `compat.supportsDeveloperRole: false` — the system prompt goes out as
-    `system`, fixing the vLLM / SGLang `Unexpected message role` 400;
-  - model-level `compat.thinkingFormat: 'qwen-chat-template'` on toggle-style thinking rows
-    (thinking table without row-level `supportsReasoningEffort`) — pi-ai then sends
-    `chat_template_kwargs.enable_thinking` (bare vLLM servers ignore the top-level
-    `enable_thinking` of the plain `qwen` format);
-- Writes go through the official settings channel (read → pure transform → whole-section
-  `settings.update('llm-pi-ai', …)`), so dsh's schema validates the write **where it is
-  written**: a dsh older than rc.8 rejects the fields with a log warning — no silent
-  misconfiguration; explicit values on any layer are never clobbered;
-- Triggers on plugin start, `llm/adapters-updated`, and `llm-pi-ai` config changes — no
-  manual config editing;
-- Response-side inline `<think>` splitting remains a **gateway concern**: bare vLLM needs
-  `--reasoning-parser qwen3` (pi-ai parses only `reasoning_content` / `reasoning` /
-  `reasoning_text`).
+`len` is the trimmed length of the message.
 
-# Dependency note
+| `len` | Base score |
+|---|---|
+| `< 8` | `0.05` |
+| `< 30` | `0.15` |
+| `< 80` | `0.30` |
+| `< 200` | `0.45` |
+| `< 500` | `0.60` |
+| `≥ 500` | `0.75` |
 
-The host half does **not** value-depend on `@deepseek-ai/dsh-settings` — since the DSH 0.1.7 line there is no settings registration at all: the settings form is generated by the host from the plugin's declared schemastery schema (`.volatile()` fields), and the client half talks to the `configForms` service provided by the dsh runtime. No need to install official packages into the profile manually. `dependencies` is just `@deepseek-ai/schemastery` (installed automatically with the package).
+The hit is recorded as `len:<n>`.
+
+### Step 3 — keyword classes
+
+Case-insensitive substring match. The weight is applied once per class (being "about refactoring" is
+one signal, not three), while every matched word is recorded in `reasons[]`.
+
+| Class | Effect | Reason tag |
+|---|---|---|
+| complex | `score = max(score, 0.55)`, then `+0.10` | `kw:<word>` |
+| heavy | `+0.10` | `kw:<word>` |
+| simple | `score × 0.7` | `kw:<word>` |
+| trivial | only when `len < 60`: `score = min(score × 0.3, 0.2)` | `kw:<word>` |
+
+### Step 4 — structural signals
+
+| Signal | Detection | Effect | Reason tag |
+|---|---|---|---|
+| code block | contains a ``` fence | `+0.15` | `code-block` |
+| stack trace | a pasted failure fingerprint (`traceback`, `error:`, `exception`, a source frame, `panic`) | `+0.20` | `stack-trace` |
+| file path | a source-file extension (`ts`, `tsx`, `js`, `jsx`, `py`, `go`, `rs`, `java`, `json`, `yaml`, `toml`, `md`, `sql`) | `+0.10` | `file-path` |
+| short question | ends with `?` or `？` and `len < 60` | `× 0.8` | `short-question` |
+
+### Step 5 — context signals
+
+| Signal | Condition | Effect | Reason tag |
+|---|---|---|---|
+| attachments | `attachments > 0` | `+0.05` | `attachments` |
+| many tools | `toolCount ≥ 6` | `+0.10` | `tool-count` |
+| tool errors | `priorErrors ≥ 1` | `+0.15` | `tool-error` |
+| repeated errors | `priorErrors ≥ 3` | another `+0.10` | `tool-error:repeated` |
+
+### Step 6–7 — clamp and bands
+
+The score is clamped to `[0, 1]`, then banded:
+
+| Score | Difficulty |
+|---|---|
+| `< 0.25` | `trivial` |
+| `< 0.45` | `simple` |
+| `< 0.70` | `moderate` |
+| `≥ 0.70` | `complex` |
+
+### Difficulty → base level
+
+| Difficulty | Base level |
+|---|---|
+| `trivial` | `low` |
+| `simple` | `low` |
+| `moderate` | `high` |
+| `complex` | `max` when `allowUpgrade`, otherwise `high` |
+| `explicit` | the requested level, injected directly (scheduler bypassed) |
+
+### Tool correction (current turn only)
+
+With at least two tool samples in the turn, the base level can be nudged — never below `low`,
+never above `max`, and only in directions the two toggles allow:
+
+| Condition | Result |
+|---|---|
+| ≥ 75% simple tools (small args) and `allowDowngrade` and base is `high` | `low` |
+| largest tool args ≥ 3200 chars and `allowUpgrade` | `max` (this wins over the downgrade) |
+| fewer than two samples | base level unchanged |
+
+### Hysteresis
+
+The scheduler remembers the last level it emitted for the session. A different level must be proposed
+on `hysteresisSteps` consecutive requests before it is adopted; a decision that agrees with the level
+in force cancels the pending candidate, so an alternating `high` / `low` pattern never switches. The
+first decision of a session is adopted immediately. Set `hysteresisSteps: 1` for pure per-request
+behavior.
+
+### Worked example
+
+`帮我重构 src/auto-schedule-projection.ts 的缓存层，附上报错：TypeError at index.ts:42`
+
+- length ≈ 70 → base `0.30`
+- complex keyword (`重构`) → `max(0.30, 0.55) + 0.10 = 0.65`
+- `file-path` → `0.75`, `stack-trace` → `0.95`
+- clamped `0.95` → `complex` → `max` (when `allowUpgrade`), otherwise `high`
+- reasons: `['len:70', 'kw:重构', 'file-path', 'stack-trace']`
+
+## What changed in this fork
+
+1. **Difficulty comes from the prompt.** The classifier reads the latest user message first; tool
+   history is a correction, not the primary signal.
+2. **Turn isolation.** Tool samples are windowed per turn and cleared when a new prompt arrives, so
+   a long session does not carry stale cheapness (or stale heaviness) into the next question.
+3. **Safe fallback direction.** A failed projection read or a parse failure falls back to `high`
+   (configurable via `safeFallback`) instead of degrading to `low`.
+4. **Clamp downward.** When the model does not advertise the chosen level, the auto path picks the
+   nearest lower level rather than jumping to the highest one.
+5. **Hysteresis.** `hysteresisSteps` (default 2) prevents the wire level from flapping between
+   adjacent requests.
+6. **Windows-aware tool names.** `pwsh`, `shell`, `powershell` and `apply_patch` are recognized as
+   simple tools alongside the Unix names.
+7. **Custom wire ids survive.** A level the user picked that maps to a custom wire value (for
+   example `ultra`) is passed through instead of being normalized away.
+8. **Explainable decisions.** Every decision carries `reasons[]` (`len:`, `kw:`, `code-block`,
+   `stack-trace`, `tool-error`, …) into the log line, so a surprising level can be traced back to
+   the signal that caused it.
+
+## Known limitations
+
+- **It is a heuristic.** Length and keyword thresholds read a long but trivial prompt as `moderate`
+  or `complex`. Tune the keyword lists, pin a level, or use an `[effort: …]` marker when the guess
+  is wrong.
+- **Defaults are Chinese + English.** Substring matching works for other languages only if you add
+  your own keywords.
+- **Text only.** Attachments contribute `+0.05`; their contents are not classified.
+- **Eight samples per turn.** The tool correction sees at most the last eight tool calls of the
+  turn; `toolCount` still counts all of them.
+- **Hysteresis has a cost.** With `hysteresisSteps: 2`, a genuine jump (say `low` → `max` for an
+  error storm) takes two decisions to land.
+- **The scheduler never picks `off`.** Disabling thinking is a manual choice only.
+- **Host support.** Models that advertise no reasoning effort never receive the field; hosts
+  without the session projection fall back to `safeFallback`.
+- **Upgrading from upstream.** This is a separate package and a separate composition row; it does
+  not replace an installed `dsh-thinking-levels`, and running both would fight over
+  `reasoningEffort`. Remove the old one first.
 
 ## Development
 
 ```bash
-npm run lint        # eslint (typescript-eslint flat config)
-npm run typecheck   # tsc --noEmit
-npm test            # vitest — 46 tests
+pnpm install
+pnpm run typecheck
+pnpm run test
+pnpm run build          # tsc -> lib/, tsdown -> lib/client.js
 ```
 
-Test coverage: level policy (manual pass-through incl. the extended levels, `on` clamping, auto scheduler, validation, simple-tool boundary), the model-capability guard (`reasoningEffortSupported`, `resolveEffortInjection` stripping/passthrough), session-event parsing (guards, window cap, malformed records), the config schema (defaults lockstep, out-of-band rejection, `models` overrides), and the official-compat sync (identification, explicit-value respect, identity idempotence, write-time schema gating).
+Static plugin check (guidance package, optional):
 
+```bash
+node <path-to>/dsh-plugin-guide/bin/dsh-plugin-dev.js check --cwd .
+```
 
-## Pricing catalog (4.3.0+)
+## License and acknowledgements
 
-Billing samples are priced at fold time from a builtin catalog (src/price-catalog.ts): 29 model entries x region. DeepSeek V4.1-Flash / V4-Flash / V4-Pro carry the official peak/off-peak pairs (Beijing 09:00-12:00 and 14:00-18:00 on workdays are peak; the 2026 State Council holiday/make-up table is applied, with make-up-workday weekends counted as workdays); GLM / Kimi / Qwen / Doubao / MiniMax / Ernie carry flat CN rates. Each entry prices three slots per million tokens — non-cached input, cache-hit input and output — with asOf + source annotations; currency follows the entry (¥ CNY, $ USD, no FX conversion). Overseas (USD) catalog slots are intentionally empty until official pages can be re-verified.
+MIT. This repository is a fork of
+[`drscrewdriver/dsh-thinking-levels` 4.4.8](https://github.com/drscrewdriver/dsh-thinking-levels);
+the upstream MIT text is kept verbatim in [LICENSE](./LICENSE), with our copyright line added, and
+[NOTICE](./NOTICE) records the split between upstream code and our additions.
 
-Models outside the catalog fall to the defaultPricing setting (cn / global / custom / off, default off): "off" renders the billing popover as unpriced while token counters keep working — nothing is silently estimated any more.
-
-Semantics note: a pricing or policy change only affects samples booked after the change; the first time you open an old session right after upgrading, its cumulative ledger is refolded once against the current catalog.
-
-## License
-
-MIT
+Thanks to drscrewdriver for the original plugin — the host wiring, the client UI and the
+settings/volatile-config plumbing come from there. The inlined whale-girl mascot is community
+artwork from `HanaAyane/dsh-reasoning-effort`, kept with attribution (see [NOTICE](./NOTICE)).

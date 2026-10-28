@@ -1,55 +1,22 @@
 # 安装指南（官方 DSH CLI）
 
-本指南只使用官方 `dsh plugin` 命令。该命令会把依赖装进 profile 并同步 `dsh.profile.bundles`。不要用普通 `npm install`、在 profile 里直接 `pnpm add` 或手工编辑 profile 清单代替。
+本插件以 DSH **bundle** 形式发布：一份 `dsh` 声明的 patch 层 + 一份客户端半侧。请用官方 `dsh plugin`
+命令安装，它会把 profile 依赖、lockfile 与 `dsh.profile.bundles` 层栈一起更新。不要用普通
+`npm install`、在 profile 里直接 `pnpm add`，或手工编辑 profile 清单来替代它。
 
 - [安装指南](./INSTALL.zh.md)
 - [English installation guide](./INSTALL.md)
-- [日本語インストールガイド](./INSTALL.ja.md)
-- [한국어 설치 안내](./INSTALL.ko.md)
-- [Guide d'installation en français](./INSTALL.fr.md)
-- [Installationsanleitung auf Deutsch](./INSTALL.de.md)
-- [Guida all'installazione in italiano](./INSTALL.it.md)
-- [Руководство по установке на русском](./INSTALL.ru.md)
-- [Guía de instalación en español](./INSTALL.es.md)
 - [中文 README](./README.zh.md)
 - [English README](./README.md)
-- [日本語 README](./README.ja.md)
-- [한국어 README](./README.ko.md)
-- [README en français](./README.fr.md)
-- [Deutsche README](./README.de.md)
-- [README in italiano](./README.it.md)
-- [README на русском](./README.ru.md)
-- [README en español](./README.es.md)
-- [版本更新日志](./CHANGELOG.md)
-- [日本語 changelog](./CHANGELOG.ja.md)
-- [한국어 changelog](./CHANGELOG.ko.md)
-- [Changelog en français](./CHANGELOG.fr.md)
-- [Changelog auf Deutsch](./CHANGELOG.de.md)
-- [Changelog in italiano](./CHANGELOG.it.md)
-- [Список изменений на русском](./CHANGELOG.ru.md)
-- [Changelog en español](./CHANGELOG.es.md)
+- [更新日志](./CHANGELOG.md)
 
-本指南中的占位符：
+## 0. 前置条件
 
-- `<profile>`：要修改的 DSH profile，通常是 `web`；
-- `dsh-thinking-levels`：npm 包名与运行时插件 ID；
-- `thinking-levels`：Cordis 组合条目与设置页 Slot ID。
-
-> **版本要求 —— 仅支持 DSH v0.2.0-rc.1 及以上。**
->
-> 安装前先确认版本（`dsh --version`）。
->
-> | DSH 版本 | 操作 |
-> | --- | --- |
-> | ≥ 0.2.0-rc.1 | 安装本版本（4.0.x）。 |
-> | ≥ 0.1.7-rc.1 至 < 0.2.0 | 安装 3.x 线：`dsh plugin --profile <profile> add dsh-thinking-levels@dsh-0.1.7 -w`（3.4.3）。 |
-> | < 0.1.7-rc.1 | 留在旧版插件（3.0.2）。**不要在 DSH 0.1.7+ 上运行旧版插件，请升级插件。** |
->
-> 分界点是 `0.1.7-rc.1`：该版本删除了命令式设置注册（`settings.register` / `installSettingsSection`）与客户端 `settingsScope` 服务。自此之后，3.x 线（0.1.7 宿主）与本版本（0.2.0-rc 宿主）面向同一声明式设置表面（`.volatile()` schema 字段 + `configForms`）。
-
-> 旧版 DSH 通过 npm dist-tag 安装对应线：`dsh plugin add dsh-thinking-levels@dsh-0.1.7`（DSH 0.1.7–0.1.x，插件 3.4.3）、`...@dsh-0.1.5`（DSH 0.1.5）、`...@dsh-0.1.2`（DSH 0.1.2）、`...@compat`（DSH 0.1.0–0.1.1）。不要安装 ≤ 0.6.0 的旧 0.x 版本——它们没有声明任何 dsh peer 依赖。
-
-## 0. 前置检查与 profile 确认
+| 项 | 要求 |
+|---|---|
+| Node.js | 22.19+ 或 24+ |
+| DSH | `engines.dsh` 与 peer 范围里列出的 rc（截至 `0.2.1-rc.3`）之一 |
+| 包管理器 | pnpm 11——随 `dsh` CLI 提供，无需另装 |
 
 ```bash
 echo "DSH_HOME=${DSH_HOME:-$HOME/.dsh}"
@@ -57,136 +24,113 @@ dsh --version
 ls "${DSH_HOME:-$HOME/.dsh}/profiles"
 ```
 
-使用你正在运行的 DSH 进程对应的 profile。`web` 很常见，但以实际 `--profile` 参数为准。
+请使用**正在运行的那个 DSH 进程**所用的 profile。常见的是 `web`；以实际 `--profile` 参数为准。
 
-## 1. 官方安装
+> 如果已经装了上游 `dsh-thinking-levels`，先卸掉——两个插件会为同一个请求注入 `reasoningEffort`，只会互相打架。
 
-安装最新版本：
+## 1. 安装
 
-```bash
-dsh plugin --profile <profile> add dsh-thinking-levels -w
-```
-
-（当 profile 是 pnpm workspace root 时必须带 `-w`，`web` 就是。）
-
-显式安装当前发布版：
+**从 npm 安装（推荐，`lib/` 已构建）：**
 
 ```bash
-dsh plugin --profile <profile> add dsh-thinking-levels@4.0.0 -w
+dsh plugin --profile web add dsh-auto-reasoning-effort -w
 ```
 
-官方 CLI 会自动更新 profile 依赖、锁文件与 `dsh.profile.bundles`。不要手工追加 YAML。
+`-w` 是必需的，因为 `web` profile 本身是 pnpm workspace 根。需要可复现安装时钉版本：
 
-### 供应链冷却期
+```bash
+dsh plugin --profile web add dsh-auto-reasoning-effort@0.1.0 -w
+```
 
-dsh 运行环境使用 pnpm 11，其 `minimumReleaseAge` 策略可能拦截刚发布的版本，报
-`ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION`。把版本加入 `~/.dsh/profiles/web/pnpm-workspace.yaml` 的
-`minimumReleaseAgeExclude`：
+**从 GitHub 源码安装（会执行包里的 `prepare` 脚本）：**
+
+```bash
+dsh plugin --profile web add github:lion231226/dsh-auto-reasoning-effort -w
+```
+
+pnpm ≥ 10 默认拦截 git 依赖的构建脚本。第一次执行会告诉你哪个包需要放行，把它写进 profile 的
+`pnpm-workspace.yaml`：
 
 ```yaml
-minimumReleaseAgeExclude:
-  - dsh-thinking-levels@4.0.0
+allowBuilds:
+  dsh-auto-reasoning-effort: true
 ```
 
-## 2. 升级
+只对可信来源这么做，并尽量钉住 commit（`github:lion231226/dsh-auto-reasoning-effort#<sha>`）。
+从 npm 或 tarball 安装可以完全避开构建步骤。
 
-升级到 registry 最新版本：
+**从 tarball 安装（离线环境）：**
 
 ```bash
-dsh plugin --profile <profile> update dsh-thinking-levels -w
+pnpm pack                       # 产出 dsh-auto-reasoning-effort-0.1.0.tgz
+dsh plugin --profile web add ./dsh-auto-reasoning-effort-0.1.0.tgz -w
 ```
 
-宿主侧改动需重启 DSH；浏览器侧刷新 Web 页面。
+**从 dsh-market 安装（图形界面）：** 打开插件市场，搜索 `dsh-auto-reasoning-effort` 安装。
+若条目尚未收录，用上面任一命令行方式。
 
-## 3. 本地路径 / link: 注册（备选）
+## 2. 重启
 
-开发或离线安装时，可以从本地检出注册插件：
+正在运行的宿主不会热加载新的 bundle 层：
 
 ```bash
-#    ~/.dsh/profiles/web/package.json dependencies 增加：
-#      "dsh-thinking-levels": "link:<dsh-thinking-levels 的绝对路径>"
-#    ~/.dsh/profiles/web/cordis.patch.yml：
-#      - insert:
-#          - id: thinking-levels
-#            name: dsh-thinking-levels
-cd ~/.dsh/profiles/web && pnpm install && dsh web
+dsh web
 ```
 
-或用官方 CLI 加本地路径（无需网络）：
+随后刷新 Web 页面，让客户端半侧也生效。
+
+## 3. 验证
+
+检查依赖与已装版本：
 
 ```bash
-dsh plugin --profile <profile> add /dsh-thinking-levels 的绝对路径/ -w
+grep -n "dsh-auto-reasoning-effort" \
+  "${DSH_HOME:-$HOME/.dsh}/profiles/web/package.json"
+node -p "require('${DSH_HOME:-$HOME/.dsh}/profiles/web/node_modules/dsh-auto-reasoning-effort/package.json').version"
+# 期望输出：0.1.0
 ```
 
-## 4. 验证安装
-
-检查依赖与安装版本：
+检查组合行：
 
 ```bash
-grep -n "dsh-thinking-levels" \
-  "${DSH_HOME:-$HOME/.dsh}/profiles/<profile>/package.json"
-node -p "require('${DSH_HOME:-$HOME/.dsh}/profiles/<profile>/node_modules/dsh-thinking-levels/package.json').version"
+dsh --profile web --dump-config | grep -n -A2 "dsh-auto-reasoning-effort"
 ```
 
-本版本的版本号必须是 `4.0.0`。
+组合里必须有这一行（`name: dsh-auto-reasoning-effort`）。启动输出里若出现
+`patch: entry <id> not found`，说明某个配置覆盖指向了已不存在的行。
 
-检查官方组合配置：
+检查设置表单：**Settings → Plugins → dsh-auto-reasoning-effort** 应显示启用开关、档位选择器与调度开关
+——这些字段由宿主根据插件的 `.volatile()` schema 生成。
+
+检查运行时：在会话模型选择器里选 **Auto**，发一条请求，日志里会出现调度行——包含模型、难度、分数、
+命中理由与最终档位。手动选档时不会出现调度行（调度器按设计让路）。
+
+## 4. 升级 / 卸载
 
 ```bash
-dsh --profile <profile> --dump-default-config
+# 升级
+dsh plugin --profile web update dsh-auto-reasoning-effort -w
+
+# 卸载
+dsh plugin --profile web remove dsh-auto-reasoning-effort -w
 ```
 
-应包含：
+两种操作之后都要重启宿主。
 
-```yaml
-- id: thinking-levels
-  name: dsh-thinking-levels
-```
+## 5. 排错
 
-## 5. 验证设置表单
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| `ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION` | pnpm 11 对新发布版本有供应链冷却期 | 在 profile 的 `pnpm-workspace.yaml` 的 `minimumReleaseAgeExclude` 里加上 `dsh-auto-reasoning-effort@0.1.0` |
+| `installation rejected: … is incompatible with dsh <version>` | 当前 DSH 不在声明的 peer 范围内 | 升级到受支持的 rc，或授予精确版本豁免：`dsh plugin --profile web allow-version dsh-auto-reasoning-effort@0.1.0 --dsh-version <version> --accept-risk` |
+| 安装命令抱怨 workspace 根 | 少了 `-w` | 在命令末尾加 `-w` |
+| git 安装卡在构建脚本被拦截 | pnpm 没有执行 `prepare` | 在 `allowBuilds` 里放行（见 §1），或改用 npm / tarball |
+| 装好了但模型面板没有 Auto | 客户端半侧没加载，或该模型不广告任何推理档位 | 确认组合行存在、刷新页面，再检查 `models` 能力覆盖 |
+| 档位频繁跳动 | 难度启发式被关键词触发 | 调大 `hysteresisSteps`、钉死档位，或精简关键词表 |
 
-重启 DSH 后刷新 Web 页面。打开「设置 → 插件」，找到 **dsh-thinking-levels** 条目——自 DSH 0.1.7 起，表单由宿主按插件声明的 `.volatile()` schema 字段自动生成（不再有自定义客户端卡片）。
+## 6. 相关链接
 
-1. 表单包含启用开关、档位选择器（8 个标准档位加 `auto`）与调度开关（`allowDowngrade` / `allowUpgrade`）。
-2. 提交的改动对下一次模型请求生效，无需重启（实时 volatile 配置）。
-3. 逐模型能力编辑器（网关线上值、llm-pi-ai）随被废除的卡片一并移除——请通过官方「模型」设置面编辑 llm-pi-ai 模型能力。
-4. 搜索框可筛选模型；官方/通用预设一键应用到全部思考模型。
-
-## 日语与韩语支持状态
-
-插件自带 `ja` 与 `ko` 字典，但当前官方 DSH 只通过 `LocaleRuntime` 暴露 `zh` 和 `en`。在原版 DSH 上选择日语或韩语会报 `locale "<id>" is not registered`。
-
-官方支持落地前要使用它们，请维护 DSH fork 并更新：
-
-- `packages/client/locale/src/locale-settings.ts`：把 `ja` 与 `ko` 加入 `LOCALE_IDS`（Host 偏好 schema 由该列表派生）。
-- `packages/client/locale/src/client/index.ts`：在 `LOCALES` 中加入 `{ id: 'ja', label: '日本語' }` 与 `{ id: 'ko', label: '한국어' }`。
-- 补齐对应的核心字典与测试，然后重新构建并运行 fork 版本。
-
-仅修改插件无法扩展 DSH 的全局 locale 列表。请使用 fork 文档中的构建与官方 profile 命令；不要手工编辑 profile 清单。
-
-## 6. 排查
-
-| 症状 | 处理 |
-| --- | --- |
-| 找不到 `dsh` 命令 | 安装或启用官方 DSH CLI。不要用普通 npm/pnpm 命令模拟 profile 安装。 |
-| `ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION` | 把版本加入 profile 的 `pnpm-workspace.yaml` 的 `minimumReleaseAgeExclude`。 |
-| 插件显示「已停用/未挂载」且无错误 | 检查 profile 组合；宿主不得值依赖 `@deepseek-ai/dsh-settings`（本插件没有）。 |
-| client 入口不在 `__DSH_BOOT__` | 确认 `exports["./client"]` 存在且 host fiber 已建立。 |
-| 模型选择器没有 `Auto` | 确认 adapter `resolveModel` 包装已生效（`llm/adapters-updated` 时重新包装）。 |
-| 设置表单写入失败 | 值被插件 schema 拒绝；请对齐声明的 `.volatile()` 字段类型。 |
-| 子 agent 报 `UNSUPPORTED_REASONING_EFFORT` | 目标模型未声明该档位；改用支持的档位或恢复提供方默认。 |
-| 浏览器显示旧 bundle | 升级后硬刷新（Ctrl+Shift+R）。 |
-
-## 7. 卸载
-
-使用官方命令：
-
-```bash
-dsh plugin --profile <profile> remove dsh-thinking-levels -w
-```
-
-确认组合配置不再包含该 bundle：
-
-```bash
-dsh --profile <profile> --dump-default-config
-```
+- [README](./README.zh.md) · [English README](./README.md) — 算法、配置、已知限制
+- [更新日志](./CHANGELOG.md)
+- [NOTICE](./NOTICE) — fork 来源与作者归属划分
+- 上游项目：[drscrewdriver/dsh-thinking-levels](https://github.com/drscrewdriver/dsh-thinking-levels)

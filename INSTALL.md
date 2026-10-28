@@ -1,55 +1,23 @@
-# Installation Guide (Official DSH CLI)
+# Installation guide (official DSH CLI)
 
-This guide uses only the official DSH `dsh plugin` command. The command installs the dependency into a profile and synchronizes `dsh.profile.bundles`. Do not replace it with plain `npm install`, direct `pnpm add` in the profile, or manual edits to the profile manifest.
+This plugin ships as a DSH **bundle**: a `dsh`-declared patch layer plus a client half. Install it
+with the official `dsh plugin` command, which updates the profile dependency, the lockfile and the
+`dsh.profile.bundles` stack together. Do not replace it with a plain `npm install`, a bare
+`pnpm add` inside the profile, or hand-edited profile manifests.
 
 - [English installation guide](./INSTALL.md)
 - [中文安装指南](./INSTALL.zh.md)
-- [日本語インストールガイド](./INSTALL.ja.md)
-- [한국어 설치 안내](./INSTALL.ko.md)
-- [Guide d'installation en français](./INSTALL.fr.md)
-- [Installationsanleitung auf Deutsch](./INSTALL.de.md)
-- [Guida all'installazione in italiano](./INSTALL.it.md)
-- [Руководство по установке на русском](./INSTALL.ru.md)
-- [Guía de instalación en español](./INSTALL.es.md)
 - [English README](./README.md)
 - [中文 README](./README.zh.md)
-- [日本語 README](./README.ja.md)
-- [한국어 README](./README.ko.md)
-- [README en français](./README.fr.md)
-- [Deutsche README](./README.de.md)
-- [README in italiano](./README.it.md)
-- [README на русском](./README.ru.md)
-- [README en español](./README.es.md)
 - [Changelog](./CHANGELOG.md)
-- [日本語 changelog](./CHANGELOG.ja.md)
-- [한국어 changelog](./CHANGELOG.ko.md)
-- [Changelog en français](./CHANGELOG.fr.md)
-- [Changelog auf Deutsch](./CHANGELOG.de.md)
-- [Changelog in italiano](./CHANGELOG.it.md)
-- [Список изменений на русском](./CHANGELOG.ru.md)
-- [Changelog en español](./CHANGELOG.es.md)
 
-The placeholders in this guide are:
+## 0. Prerequisites
 
-- `<profile>`: the DSH profile to modify, usually `web`;
-- `dsh-thinking-levels`: the npm package and runtime plugin ID;
-- `thinking-levels`: the Cordis composition and settings Slot ID.
-
-> **Version requirement — DSH v0.2.0-rc.1 or newer.**
->
-> Check the running version first (`dsh --version`).
->
-> | DSH version | Action |
-> | --- | --- |
-> | ≥ 0.2.0-rc.1 | Install this release (4.0.x). |
-> | ≥ 0.1.7-rc.1 to < 0.2.0 | Install the 3.x line: `dsh plugin --profile <profile> add dsh-thinking-levels@dsh-0.1.7 -w` (3.4.3). |
-> | < 0.1.7-rc.1 | Stay on the previous plugin line (3.0.2). Do not run an older plugin build against DSH 0.1.7+ — upgrade the plugin instead. |
->
-> The boundary is `0.1.7-rc.1`, where DSH removed the imperative settings registration (`settings.register` / `installSettingsSection`) and the client `settingsScope` service. Since that boundary both the 3.x line (0.1.7 hosts) and this release (0.2.0-rc hosts) target the same declarative settings surface (`.volatile()` schema fields + `configForms`).
-
-> Older DSH lines install from npm via their dist-tag: `dsh plugin add dsh-thinking-levels@dsh-0.1.7` (DSH 0.1.7–0.1.x, plugin 3.4.3), `...@dsh-0.1.5` (DSH 0.1.5), `...@dsh-0.1.2` (DSH 0.1.2), `...@compat` (DSH 0.1.0–0.1.1). Never install the bare `latest`-era `0.x` versions (≤ 0.6.0) — they carry no dsh peer declarations.
-
-## 0. Prerequisites and profile discovery
+| Requirement | Value |
+|---|---|
+| Node.js | 22.19+ or 24+ |
+| DSH | one of the rc versions enumerated in `engines.dsh` / the peer ranges (up to `0.2.1-rc.3`) |
+| Package manager | pnpm 11 — bundled with the `dsh` CLI; no separate install needed |
 
 ```bash
 echo "DSH_HOME=${DSH_HOME:-$HOME/.dsh}"
@@ -57,135 +25,117 @@ dsh --version
 ls "${DSH_HOME:-$HOME/.dsh}/profiles"
 ```
 
-Use the profile named by your running DSH process. `web` is common, but the active `--profile` argument is authoritative.
+Use the profile your running DSH process was started with. `web` is the common one; the active
+`--profile` argument is authoritative.
 
-## 1. Official installation
+> If you already run the upstream `dsh-thinking-levels`, remove it first — both plugins inject
+> `reasoningEffort` for the same request and would fight over the level.
 
-Install the latest version:
+## 1. Install
 
-```bash
-dsh plugin --profile <profile> add dsh-thinking-levels -w
-```
-
-(The `-w` flag is required when the profile is a pnpm workspace root, as `web` is.)
-
-Install the current release explicitly:
+**From npm (recommended — `lib/` is prebuilt):**
 
 ```bash
-dsh plugin --profile <profile> add dsh-thinking-levels@4.0.0 -w
+dsh plugin --profile web add dsh-auto-reasoning-effort -w
 ```
 
-The official CLI updates the profile dependency, lockfile, and `dsh.profile.bundles` automatically. Do not add a manual YAML row.
+`-w` is required because the `web` profile is a pnpm workspace root. Pin the version when you want
+reproducible installs:
 
-### Supply-chain cooling period
+```bash
+dsh plugin --profile web add dsh-auto-reasoning-effort@0.1.0 -w
+```
 
-The dsh runtime uses pnpm 11, whose `minimumReleaseAge` policy may block a freshly published
-version with `ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION`. Add the version to
-`minimumReleaseAgeExclude` in `~/.dsh/profiles/web/pnpm-workspace.yaml`:
+**From GitHub (source install; runs the package `prepare` script):**
+
+```bash
+dsh plugin --profile web add github:lion231226/dsh-auto-reasoning-effort -w
+```
+
+pnpm ≥ 10 blocks dependency build scripts by default for git installs. The first attempt tells you
+which package needs approval; add it to the profile's `pnpm-workspace.yaml`:
 
 ```yaml
-minimumReleaseAgeExclude:
-  - dsh-thinking-levels@4.0.0
+allowBuilds:
+  dsh-auto-reasoning-effort: true
 ```
 
-## 2. Upgrade
+Only do that for sources you trust, and pin a commit (`github:lion231226/dsh-auto-reasoning-effort#<sha>`)
+when you do. Installing from npm or from a packed tarball avoids the build step entirely.
 
-Upgrade to the latest registry version:
+**From a tarball (offline / air-gapped):**
 
 ```bash
-dsh plugin --profile <profile> update dsh-thinking-levels -w
+pnpm pack                       # produces dsh-auto-reasoning-effort-0.1.0.tgz
+dsh plugin --profile web add ./dsh-auto-reasoning-effort-0.1.0.tgz -w
 ```
 
-Restart DSH for host changes and refresh the Web page for client changes.
+**From dsh-market (GUI):** open the plugin browser, search `dsh-auto-reasoning-effort`, install. If
+the entry is not listed yet, use one of the CLI channels above.
 
-## 3. Local-path / link: registration (alternative)
+## 2. Restart
 
-For development or offline installs, register the plugin from a local checkout:
+A running host does not hot-load a new bundle layer:
 
 ```bash
-#    ~/.dsh/profiles/web/package.json dependencies:
-#      "dsh-thinking-levels": "link:<absolute path to dsh-thinking-levels>"
-#    ~/.dsh/profiles/web/cordis.patch.yml:
-#      - insert:
-#          - id: thinking-levels
-#            name: dsh-thinking-levels
-cd ~/.dsh/profiles/web && pnpm install && dsh web
+dsh web
 ```
 
-Or use the official CLI with a local path (no network needed):
+Then refresh the Web page so the client half is picked up.
+
+## 3. Verify
+
+Dependency and installed version:
 
 ```bash
-dsh plugin --profile <profile> add /absolute/path/to/dsh-thinking-levels -w
+grep -n "dsh-auto-reasoning-effort" \
+  "${DSH_HOME:-$HOME/.dsh}/profiles/web/package.json"
+node -p "require('${DSH_HOME:-$HOME/.dsh}/profiles/web/node_modules/dsh-auto-reasoning-effort/package.json').version"
+# expected: 0.1.0
 ```
 
-## 4. Verify installation
-
-Check the dependency and installed version:
+Composition row:
 
 ```bash
-grep -n "dsh-thinking-levels" \
-  "${DSH_HOME:-$HOME/.dsh}/profiles/<profile>/package.json"
-node -p "require('${DSH_HOME:-$HOME/.dsh}/profiles/<profile>/node_modules/dsh-thinking-levels/package.json').version"
+dsh --profile web --dump-config | grep -n -A2 "dsh-auto-reasoning-effort"
 ```
 
-The version must be `4.0.0` for this release.
+The row must be present (as `name: dsh-auto-reasoning-effort`). A `patch: entry <id> not found`
+line in the startup output means a config override targets a row that no longer exists.
 
-Check the official composition:
+Settings form: **Settings → Plugins → dsh-auto-reasoning-effort** shows the enable toggle, the level
+picker and the scheduler toggles, generated by the host from the plugin's `.volatile()` schema fields.
+
+Runtime: pick **Auto** in the session model selector, send a request, and look for the scheduling
+log line — it names the model, the difficulty, the score, the reasons and the resulting level.
+A manual level pick logs no scheduling line (the scheduler is bypassed by design).
+
+## 4. Upgrade / uninstall
 
 ```bash
-dsh --profile <profile> --dump-default-config
+# upgrade
+dsh plugin --profile web update dsh-auto-reasoning-effort -w
+
+# uninstall
+dsh plugin --profile web remove dsh-auto-reasoning-effort -w
 ```
 
-It must contain:
+Restart the host after either one.
 
-```yaml
-- id: thinking-levels
-  name: dsh-thinking-levels
-```
+## 5. Troubleshooting
 
-## 5. Verify the settings form
+| Symptom | Cause | Fix |
+|---|---|---|
+| `ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION` | pnpm 11 supply-chain cooling period on a fresh version | add `dsh-auto-reasoning-effort@0.1.0` to `minimumReleaseAgeExclude` in the profile's `pnpm-workspace.yaml` |
+| `installation rejected: … is incompatible with dsh <version>` | your DSH build is outside the declared peer ranges | upgrade DSH to a supported rc, or grant the exact-version exemption: `dsh plugin --profile web allow-version dsh-auto-reasoning-effort@0.1.0 --dsh-version <version> --accept-risk` |
+| the add command complains about a workspace root | `-w` missing | append `-w` |
+| git install fails on a blocked build script | pnpm did not run `prepare` | approve the package in `allowBuilds` (see §1), or install from npm/tarball |
+| plugin installed but the model panel shows no Auto | the client half did not load, or the model advertises no reasoning effort | confirm the composition row exists, refresh the page, then check the model's `models` capability overrides |
+| levels jump around | difficulty heuristic is reacting to keywords | raise `hysteresisSteps`, pin a level, or trim the keyword lists |
 
-Restart DSH, then refresh the Web page. Open **Settings → Plugins** and find the **dsh-thinking-levels** entry — since DSH 0.1.7 the form is generated by the host from the plugin's declared `.volatile()` schema fields (there is no custom client card any more).
+## 6. Links
 
-1. The form shows the enable toggle, the level picker (eight standard levels plus `auto`) and the scheduler toggles (`allowDowngrade` / `allowUpgrade`).
-2. Committed changes apply to the next model request without a restart (live volatile config).
-3. The per-model capability editor (gateway wire values, llm-pi-ai) shipped with the retired card and is no longer part of this plugin — edit `llm-pi-ai` model capabilities through the official Models settings.
-
-## Japanese and Korean support status
-
-The plugin ships `ja` and `ko` dictionaries, but the current official DSH release exposes only `zh` and `en` through `LocaleRuntime`. On stock DSH, selecting Japanese or Korean fails with `locale "<id>" is not registered`.
-
-To use them before official support lands, maintain a DSH fork and update:
-
-- `packages/client/locale/src/locale-settings.ts`: add `ja` and `ko` to `LOCALE_IDS` (the Host preference schema derives from this list).
-- `packages/client/locale/src/client/index.ts`: add `{ id: 'ja', label: '日本語' }` and `{ id: 'ko', label: '한국어' }` to `LOCALES`.
-- Add the corresponding core dictionaries and tests, then rebuild and run the forked DSH.
-
-A plugin-only change cannot extend DSH's global locale list. Use the fork's documented build and official profile commands; do not manually edit a profile manifest.
-
-## 6. Troubleshooting
-
-| Symptom | Action |
-| --- | --- |
-| `dsh` is not found | Install or enable the official DSH CLI. Do not simulate profile installation with plain npm or pnpm commands. |
-| `ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION` | Add the version to `minimumReleaseAgeExclude` in the profile's `pnpm-workspace.yaml`. |
-| Plugin shows as "disabled/unmounted" with no error | Check the profile composition; the host must not value-depend on `@deepseek-ai/dsh-settings` (it does not). |
-| Client entry missing from `__DSH_BOOT__` | Confirm `exports["./client"]` exists and the host fiber was established. |
-| Model selector has no `Auto` | Confirm the adapter `resolveModel` wrapper ran (it re-runs on `llm/adapters-updated`). |
-| Settings form write fails | The value was rejected by the plugin schema; align it with the declared `.volatile()` field types. |
-| Subagent returns `UNSUPPORTED_REASONING_EFFORT` | The target model does not advertise the level; pick a supported one or restore the provider default. |
-| Stale client bundle | Hard-refresh the browser (Ctrl+Shift+R) after an upgrade. |
-
-## 7. Remove
-
-Use the official command:
-
-```bash
-dsh plugin --profile <profile> remove dsh-thinking-levels -w
-```
-
-Verify that the composed profile no longer contains the bundle:
-
-```bash
-dsh --profile <profile> --dump-default-config
-```
+- [README](./README.md) · [中文 README](./README.zh.md) — algorithm, configuration, limitations
+- [CHANGELOG](./CHANGELOG.md)
+- [NOTICE](./NOTICE) — fork origin and authorship split
+- Upstream project: [drscrewdriver/dsh-thinking-levels](https://github.com/drscrewdriver/dsh-thinking-levels)

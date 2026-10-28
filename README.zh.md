@@ -1,246 +1,310 @@
-# dsh-thinking-levels
+# dsh-auto-reasoning-effort
 
-**为 [DeepSeek Harness (dsh)](https://github.com/deepseek-ai/deepseek-harness) 提供按轮次的思考档位（`reasoning_effort`）控制：在会话模型选择器中可选 `Auto`（mask）——由插件按工具调用历史自动在 `low` / `high` / `max` 间调度后提交 API；也可手动固定 `off` / `on` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max`，让廉价工具轮次保持廉价，同时绝不让重任务缺少推理。**
+**按任务难度自动调节推理档位的 [DeepSeek Harness (dsh)](https://github.com/deepseek-ai/deepseek-harness) 插件。**
 
-> **v0.7.0-beta.1（2026-09-06）：短路路线退役。** 本版本不再依赖 `dsh-llm-openai-completions`——自定义网关修复全部改走 dsh 官方 `llm-pi-ai` compat 面（要求 **dsh ≥ v0.1.0-rc.8**），短路插件应保持卸载。详见 [CHANGELOG](./CHANGELOG.md)。
+在会话的模型选择器里选 **Auto**，插件会为**当前这一次**请求挑一个 `reasoning_effort` 线上档位——
+`low` / `high` / `max`——依据是这道题看起来有多难：你刚发出的 prompt，加上本轮的工具活动。
+一行 `cat package.json` 这种活不值当开高档；带堆栈的重构则不该省算力。当然，你也可以手动钉死任意档位。
 
 - [English README](./README.md)
-- [中文 README](./README.zh.md)
-- [日本語 README](./README.ja.md)
-- [한국어 README](./README.ko.md)
-- [README en français](./README.fr.md)
-- [Deutsche README](./README.de.md)
-- [README in italiano](./README.it.md)
-- [README на русском](./README.ru.md)
-- [README en español](./README.es.md)
-- [安装指南](./INSTALL.zh.md)
-- [English installation guide](./INSTALL.md)
-- [日本語インストールガイド](./INSTALL.ja.md)
-- [한국어 설치 안내](./INSTALL.ko.md)
-- [Guide d'installation en français](./INSTALL.fr.md)
-- [Installationsanleitung auf Deutsch](./INSTALL.de.md)
-- [Guida all'installazione in italiano](./INSTALL.it.md)
-- [Руководство по установке на русском](./INSTALL.ru.md)
-- [Guía de instalación en español](./INSTALL.es.md)
-- [版本更新日志](./CHANGELOG.md)
-- [日本語 changelog](./CHANGELOG.ja.md)
-- [한국어 changelog](./CHANGELOG.ko.md)
-- [Changelog en français](./CHANGELOG.fr.md)
-- [Changelog auf Deutsch](./CHANGELOG.de.md)
-- [Changelog in italiano](./CHANGELOG.it.md)
-- [Список изменений на русском](./CHANGELOG.ru.md)
-- [Changelog en español](./CHANGELOG.es.md)
+- [安装指南](./INSTALL.zh.md) · [Installation guide](./INSTALL.md)
+- [更新日志](./CHANGELOG.md)
 
-> **兼容性说明：** `0.6.0` 已包含日本語（`ja`）和한국어（`ko`）字典及选择项，但当前官方 DSH 只通过 `LocaleRuntime` 提供 `zh` 和 `en`。在原版 DSH 中选择 `ja` 或 `ko` 会失败，并提示 `locale "<id>" is not registered`。需要等待官方 DSH 增加对应 locale ID 后才能正常使用。高级用户可以维护 DSH fork，在 `packages/client/locale/src/locale-settings.ts` 更新 `LOCALE_IDS`，在 `packages/client/locale/src/client/index.ts` 更新 `LOCALES` 标签，并补齐核心字典和测试，然后重新构建并运行 fork 版本。仅修改本插件无法扩展 DSH 的全局 locale 列表。
+> **这是 fork，不是改名。** 本项目起步于
+> [`dsh-thinking-levels` 4.4.8](https://github.com/drscrewdriver/dsh-thinking-levels)（MIT，
+> © 2026 drscrewdriver），并换掉了它的调度信号：上游按整个会话的工具调用历史调度，本 fork 先判断
+> **任务难度**，工具活动只作微调。上游版权完整保留——见 [LICENSE](./LICENSE) 与 [NOTICE](./NOTICE)。
 
-> **版本兼容：** 本版本（4.3.x）按 **DSH 宿主精确 14 档枚举**钉定：`0.1.0-rc.8 || 0.1.1-rc.1 || 0.1.1-rc.2 || 0.1.2-rc.1 || 0.1.5-rc.1 || 0.1.5-rc.2 || 0.1.5-rc.3 || 0.1.7-rc.1 || 0.1.7-rc.2 || 0.2.0-rc.1 || 0.2.0-rc.2 || 0.2.1-rc.1 || 0.2.1-rc.2 || 0.2.1-rc.3`——逐 rc 单列，不用区间/caret；0.2.1 稳定线发布前不声明。自 0.1.7-rc.1 边界起，DSH 移除了命令式设置注册（`settings.register` / `installSettingsSection`）与客户端 `settingsScope` 服务及每插件卡片槽位，运行时调整的配置字段在 schemastery schema 中标 `.volatile()`，设置表单由宿主按 schema 自动生成（无注册调用、无客户端设置卡片），插件按请求读取实时值（由 `loader/volatile-update` 驱动）——4.0.x 面向 0.2.0-rc 区段的同一声明式表面；0.1.7-rc.1 至 <0.2.0 的宿主请使用 3.x 线（3.4.3，npm dist-tag `dsh-0.1.7`），0.1.2–0.1.6 宿主请继续使用插件 3.0.2。
+## 为什么值得折腾
 
-> **版本范围约定：** 每条兼容线都把宿主钉在本线自己的区段内。面向 0.1.x 宿主的线遵循 `>=0.1.x-rc.1 <0.1.(x+1)-0`（3.1.x：`>=0.1.7-rc.1 <0.1.8-0`；3.0.x：`>=0.1.5-alpha.1 <0.1.6-0`；2.0.x：`>=0.1.2-alpha.1 <0.1.3-0`；1.0.0-beta：`>=0.1.0-rc.8 <0.1.2-alpha.1`）；面向 0.2.x 区段的线遵循 `>=0.2.0-rc.1 <0.2.1-0`（4.0.x：`>=0.2.0-rc.1 <0.2.1-0`）。任何线都不声明开放的上限，兼容性解析器因此绝不会把插件线匹配到它并未适配的更新宿主区段。0.4.0–0.6.0 完全没有声明 dsh peer 依赖，属于无兼容性标注版本——不要安装。自 4.2.x 多线时代起，4.x 线改用上述逐 rc 精确枚举钉定宿主，区间公式仅描述历史上的分区段线。
+多步 agent 任务里，模型在每次工具调用前都要重新思考一遍，而思考阶段基本就是实际耗时的全部。
+固定 `high` 会在读文件这种琐事上烧掉几分钟；固定 `low` 又会在迁移、重构这类活上想得太浅。
+真正有用的信号不是「跑过几个工具」，而是「用户这道题有多难」。本插件把它当成主要输入。
 
-在多步工具链任务中，模型在**每一次工具调用前**都会重新思考——而这个思考过程占据了绝大部分墙钟时间（一个 50 步的 agent 任务可能在工具之间花费数分钟思考）。`dsh-thinking-levels` 接入 dsh 每一步都会重新解析的 `agent/request` waterfall（以 `prepend` 置于最外层，避免被会话模型选择覆盖），向下一次模型请求注入思考档位。
+## 它到底做了什么
 
-## 档位
+每次 `agent/request`：
 
-| 档位 | 含义 | 位置 |
+1. 取本轮最新一条用户消息，判定难度（`trivial` / `simple` / `moderate` / `complex`，或显式指定）；
+2. 难度映射到基准档位（`low` / `high` / `max`）；
+3. 用本轮的工具体验做微调（仅当本轮样本 ≥ 2 条）；
+4. 过一遍迟滞，避免档位在相邻请求间来回跳；
+5. clamp 到模型真正广告的档位——优先往**低**找最近的；
+6. 把结果写成 `reasoningEffort` 注入，并把决策理由一并写进日志。
+
+如果用户手动选了档位（模型选择器、插件 `level` 配置，或消息里的 `[effort: …]` 标记），手动选择优先，
+调度器直接让路。
+
+## 与上游 dsh-thinking-levels 的关系
+
+本仓库 fork 自
+[`drscrewdriver/dsh-thinking-levels` 4.4.8](https://github.com/drscrewdriver/dsh-thinking-levels)
+（MIT，© 2026 drscrewdriver），不是它发行线的延续。上游 MIT 原文逐字保留在 [LICENSE](./LICENSE)，并追加了
+我们的版权行；[NOTICE](./NOTICE) 写清了哪些文件属于上游、哪些是本仓库新增。4.4.8 及之前的历史留在
+[上游 CHANGELOG](https://github.com/drscrewdriver/dsh-thinking-levels/blob/main/CHANGELOG.md)。
+
+改掉的是调度语义：上游按整个会话的工具历史调度，其余管线照旧；我们先把任务难度判出来，把工具历史降级为修正项，
+并落地下面的八项修复。客户端 UI、settings/volatile 配置管线与 takeover/定价辅助逻辑都属于上游成果，原样继承。
+
+感谢 drscrewdriver 的原始插件。
+
+## 与 dsh-thinking-levels 的区别
+
+| | `dsh-thinking-levels` 4.4.8（上游） | `dsh-auto-reasoning-effort`（本 fork） |
 |---|---|---|
-| `off` | 关闭思考（仅手动选择，自动调度永不选用） | 模型选择器 / 默认档位 |
-| `on` | 开启思考（仅 toggle 型模型）：只发 `enable_thinking`，不发 think effort | 模型选择器 / 默认档位 |
-| `minimal` | 最低档（极轻任务） | 模型选择器 / 默认档位 |
-| `low` | 手动低档，对应简单对话任务（廉价轮次保持廉价） | 模型选择器 / 默认档位 |
-| `medium` | 中档 | 模型选择器 / 默认档位 |
-| `high` | 官方默认档位 | 模型选择器 / 默认档位 |
-| `xhigh` | 特高档 | 模型选择器 / 默认档位 |
-| `max` | 重任务 | 模型选择器 / 默认档位 |
-| `auto` | **mask**：按最近的工具调用历史逐轮调度，提交 API 前解析为具体档位 | 模型选择器（由插件注入元数据）/ 默认档位 |
-
-线缆档位事实（对照官方 DeepSeek 文档与 dsh `llm-deepseek` 适配器核实）：deepseek-v4-flash / v4-pro 上 `low` 1:1 生效，`medium` / `xhigh` 折叠到 `high`。适配器只接受 `off | low | high | max`，其他值抛 `UNSUPPORTED_REASONING_EFFORT`——`auto` 是插件的 mask 层，永不直接发送给 API，注入前必然解析为具体线缆档位。`on` **不是** effort 档位：它只由 toggle 型模型（Qwen3.6 类）广告，且只把 `enable_thinking` 置 true——不发送 `reasoning_effort`；effort 能力模型永不广告 `on`，所以手动选 `on` 会被剥离。
-
-## 自定义传输字段映射
-
-对 `llm-pi-ai` 手工声明的模型，可以把每个档位映射为你网关真正接受的值（借鉴 dsh-thinking-effort）：勾选档位并填写线上值，例如 `high` → `ultra`。映射存为该模型的 `reasoningEfforts` 表——Composer 选中 `High` 时，网关实际收到 `ultra`。`off` 留空表示不发送。
-
-> 该映射的可视化编辑器原先搭载在插件设置卡片上，DSH 0.1.7 迁移已将其移除（对应槽位不复存在）。请改为通过官方「模型」设置面编辑 `reasoningEfforts` 表——host 侧的检测与注入本就实时读取该配置。
-
-- 官方预设：`Off / High / Max`（官方 DeepSeek 风格）
-- 通用预设：`Off / Low / Medium / High`
-
-## 思考强度滑块（逐模型行）
-
-模型面板里的逐行思考强度下拉框已改造为**分段滑块**：点击模型行的档位 chip（显示当前生效档位或「提供方默认」），该行下方展开全宽滑动条。分段数随模型广告的档位自适应——toggle 型只有两档、官方 `off/low/high/max`、网关自定义线上值均可；目录带 `auto` mask 时 **auto 恒在最左**，其后依次 off/on 与强度递增档，未知线上值排最末。
-
-选择器头的档位 chip（4.4.0 起）显示的是**用户意图**而非调度器的解析值：意图为 `auto` 时主标签保持 **Auto**，本步实际发出的档位降为次级标注（如 `→ low`）。注意：关闭模型界面接管时，官方选择器的 chip 仍显示本步解析值（宿主投影语义，插件不可代改）。
-
-交互对齐 dsh-reasoning-effort 已批准的视觉基线：滑钮拖动时连续跟手、**松手吸附**提交（每次手势只写一次路由）；普通滑钮全主题纯白；两端刻度处滑钮完整可见；键盘 ←/→/Home/End 逐档移动。原「提供方默认」重置保留为滑块行的 ↺ 按钮。
-
-DeepSeek 行（官方路由，或 id/名称含 deepseek 的网关模型）滑钮为**鲸鱼娘奔跑立绘**：8 帧侧面奔跑 strip，乒乓循环（静止 720ms/单向，拖动中 420ms/单向），`prefers-reduced-motion` 下冻结；其他模型为普通白色圆钮。
-
-## 模型界面接管（4.4.0 起）
-
-新增设置项「模型界面接管」（`takeoverUi`，缺省关闭）：关闭时不替换官方模型弹窗——搜索、分组、加载都由宿主原生选择器负责，`auto` 档位照常经服务端广告出现；官方模型的上下文编辑在设置卡内完成。开启时恢复本插件的 ModelPanel 接管（逐行上下文/档位编辑 + 弹窗搜索）。切换即时生效，无需重载。
-
-立绘为社区鲸鱼娘二创，来源 [HanaAyane/dsh-reasoning-effort](https://github.com/HanaAyane/dsh-reasoning-effort)（`assets/chibi-runner-strip.png`）；用 `python tools/whale-mascot.py` 可重新生成内联素材。
-
-## 模型能力守卫（v0.5.0）
-
-插件**绝不向未声明推理能力的模型发送 `reasoning_effort`**。自定义 openai-completions 路由（如未配置 `reasoningEfforts` 的本地 Qwen3.6）通过 `ctx.llm.resolveModelInfo` 被判定为非推理模型，任何档位（继承的或调度产生的）都会被**剥离**而不是下发——dsh 的逐请求 `UNSUPPORTED_REASONING_EFFORT` 拒绝因此不会触发。不支持的字段绝不打进 API。
-
-版本行为：
-
-| dsh 版本 | `low` 处理 |
-|---|---|
-| rc.6（老） | 非原生：仅当配置 `models` 覆盖确认该档位时选择器才显示；注入展示（选择器 + 请求校验放行）后原样透传 |
-| rc.7+（新） | 原生：插件既不重写也不重复注入；手动选 `low` 原样透传 |
-
-auto 调度对支持的模型仍可选出 `low`——由上面的能力守卫负责让它远离不能接收它的模型。
-
-## 模型选择器 Auto
-
-会话界面模型选择器（模型旁）现在提供 **Auto** 档位（由插件注入模型目录元数据，位于线缆档位之后）：
-
-| 模型选择器选择 | 行为 |
-|---|---|
-| **Auto** | 插件按工具调用历史 + 升降档开关调度，解析成 `low` / `high` / `max` 后提交 API |
-| `off` / `on` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max` | **尊重手动选择**，插件不介入（toggle 型模型上 `on` 保持 `on`，绝不升为 effort；effort 能力模型剥离它） |
-| 未选择 | 使用插件的默认档位（见下） |
-
-## 自动调度
-
-中枢为 `high`（官方默认）。`auto` 只在 `low` / `high` / `max` 之间调度；永不选 `off`。
-
-| 最近的工具调用 | 档位 |
-|---|---|
-| 无（全新提示，纯对话） | `low` |
-| ≥75% 简单工具、小载荷、允许降档 | `low` |
-| 混合 / 重工具 | `high` |
-| 超大载荷、允许升级 | `max` |
-
-调度策略与 [dsh-tool-turbo](https://github.com/drscrewdriver/dsh-tool-turbo) 同源（同一套简单工具白名单 / 载荷阈值 / 75% 比例规则）。
-
-**采样来源（4.4.7+）**：调度器把 `tool/call` 事件折入 Session 投影（`tlAutoSchedule`），因此在 0.1.2-rc.1 起的宿主上都能看到真实工具历史；4.4.7 之前读的 `session.events` 只在 0.1.0-rc.8 上产出过样本。会话内的显式选档由 `model/selection` 事件折入，宿主回灌的档位不会被误判为手动选择。已知限制：宿主 `0.1.0-rc.8` 的投影注册面没有 `stateOf`（旧平面契约），该线继续走旧的数组读法 —— 调度照常，回灌修正不生效。
+| 主要信号 | 整个会话的工具调用历史 | 当前 prompt 的难度（长度、关键词、结构、报错） |
+| 样本窗口 | 全会话共用一个环形缓冲 | 按轮次隔离，新提问即清空 |
+| 失败兜底 | 掉到低档 | 落到 `high`（`safeFallback` 可配），不会悄悄降智 |
+| 模型不支持该档 | clamp 到已广告的最高档 | clamp 到最近的**更低**档 |
+| 抖动 | 无阻尼 | `hysteresisSteps`（默认 2）：连续 N 次同决策才切档 |
+| 简单工具识别 | Unix 风格工具名 | 额外认 `pwsh`、`shell`、`powershell`、`apply_patch` |
+| 自定义 wire 档位（`ultra` 等） | 可能被 clamp 吞掉 | 模型广告该值时原样透传 |
+| 可解释性 | 只有档位 | 每次决策带 `reasons[]`（如 `len:812`、`kw:重构`、`stack-trace`） |
 
 ## 安装
 
-完整流程（profile 确认、升级、迁移、验证、排查）见 [INSTALL.zh.md](./INSTALL.zh.md)。快速开始：
+前置条件：Node.js 22.19+（或 24+），一个落在 `package.json` peer 范围内的 DSH（截至 `0.2.1-rc.3` 的
+14 个 rc 均在内），以及 `dsh` CLI（pnpm 11 随它一起提供）。
+
+**方式一：GitHub 源码（走 `prepare` 现场构建）**
 
 ```bash
-# 1. 从 npm 把插件装进某个 profile（以 web 为例，任意 profile 均可）
-#    （web profile 是 pnpm workspace root，必须带 -w）
-dsh plugin --profile web add dsh-thinking-levels -w
-#    GitHub 安装备选：
-#    dsh plugin --profile web add https://github.com/drscrewdriver/dsh-thinking-levels.git -w
-#    本地路径备选（无需网络）：
-#    dsh plugin --profile web add /dsh-thinking-levels 的绝对路径/
+dsh plugin --profile web add github:lion231226/dsh-auto-reasoning-effort
+```
 
-# 2. 重启 dsh web（运行中的实例不会热加载新的 bundle 层）
+**方式二：npm 包（自带 `lib/`，无需构建）**
+
+```bash
+dsh plugin --profile web add dsh-auto-reasoning-effort
+```
+
+**方式三：dsh-market（图形界面）**
+
+打开 dsh-market 的插件市场，搜索 `dsh-auto-reasoning-effort` 安装。若条目尚未收录，用上面两种命令行方式即可。
+
+装完必须重启宿主——正在跑的 `dsh web` 不会热加载新的 bundle 层：
+
+```bash
 dsh web
 ```
 
-> 注意：dsh 运行环境使用 pnpm 11，新发布的版本会受 `minimumReleaseAge` 冷却期约束；如安装报
-> `ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION`，在 `~/.dsh/profiles/web/pnpm-workspace.yaml` 的
-> `minimumReleaseAgeExclude` 中加入对应版本即可。
+省点排错时间的几条备注：
 
-手动 `link:` 注册（`dsh plugin add` 的备选方式）：
+- **web** profile 本身是 pnpm workspace 根；`dsh plugin add` 若抱怨 workspace，就在命令末尾加 `-w`。
+- GitHub 安装会执行包里的 `prepare` 脚本。pnpm ≥ 10 默认拦截依赖的构建脚本，会要求你在 profile 的
+  `pnpm-workspace.yaml`（`allowBuilds`）里放行 `dsh-auto-reasoning-effort`；不想放行就改用 npm 或 tarball。
+- 组合行与 npm 包同名，都是 `dsh-auto-reasoning-effort`；profile 覆盖针对的 row id 也是它。
+- 装本插件前先卸掉 `dsh-thinking-levels`——两个调度器同时写同一个请求的 `reasoningEffort`，只会互相打架。
 
-```bash
-#    ~/.dsh/profiles/web/package.json dependencies 增加：
-#      "dsh-thinking-levels": "link:<dsh-thinking-levels 的绝对路径>"
-#    ~/.dsh/profiles/web/cordis.patch.yml：
-#      - insert:
-#          - id: thinking-levels
-#            name: dsh-thinking-levels
-cd ~/.dsh/profiles/web && pnpm install && dsh web
-```
+完整前置条件、验证步骤与排错：[INSTALL.zh.md](./INSTALL.zh.md)。
 
 ## 配置
 
-两个配置面共用同一套 schema：
+两个入口共用一份 schema：profile 组合文件（`cordis.yml`）里插件行的 `config:`，以及 Settings → Plugins
+里由 `.volatile()` 字段生成的表单（`enabled`、`level`、`allowDowngrade`、`allowUpgrade`、
+`hysteresisSteps`、`safeFallback`，改完下个请求生效、无需重启）。关键词表与 `models` 属于配置级，
+改组合文件。
 
-- **装配层** — profile 组合中插件行的 `config:`（如 `cordis.yml`）：
-  ```yaml
-  config:
-    level: auto            # off | on | minimal | low | medium | high | xhigh | max | auto —— 会话未显式选择时的默认档位
-    allowDowngrade: true   # 允许调度器降到 `high` 以下
-    allowUpgrade: false    # 禁止调度器升到 `max`
-  ```
-- **运行时** — 插件的 `.volatile()` 配置字段（`enabled`、`level`、`allowDowngrade`、`allowUpgrade`）：DSH 0.1.7 按声明的 schema 自动生成「插件」设置表单，提交的改动以实时配置引用送达插件（`loader/volatile-update`），对下一次模型请求生效，无需重启。（`models` 仍是配置级字段：请在 profile 组合中编辑。）
+| 键 | 类型 | 默认 | 含义 |
+|---|---|---|---|
+| `enabled` | boolean | `true` | 总开关。关掉后插件不注入任何值。 |
+| `level` | `off` \| `on` \| `minimal` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` \| `auto` | `auto` | 会话没有手动选择时使用的默认档位；`auto` 表示按请求调度。 |
+| `allowDowngrade` | boolean | `true` | 允许调度器在任务简单或本轮以简单工具为主时选 `low`。 |
+| `allowUpgrade` | boolean | `false` | 允许对 `complex` 任务和重型工具负载选 `max`；关掉时复杂任务封顶 `high`。 |
+| `hysteresisSteps` | 整数 1–10 | `2` | 需要连续多少次相同决策，才真正切换线上档位；`1` 等于关掉阻尼。 |
+| `safeFallback` | `low` \| `high` \| `max` | `high` | 会话投影读不到、或难度输入解析失败时使用的档位。 |
+| `difficulty.complexKeywords` | string[] | 见下 | 命中后先把分数抬到至少 `0.55`，再 `+0.10`。 |
+| `difficulty.heavyKeywords` | string[] | 见下 | 命中 `+0.10`。 |
+| `difficulty.simpleKeywords` | string[] | 见下 | 命中后分数 `× 0.7`。 |
+| `difficulty.trivialKeywords` | string[] | 见下 | 命中且 `len < 60` 时，分数取 `min(score × 0.3, 0.2)`。 |
+| `models` | map | `{}` | 按 `provider/model` 覆盖模型能力；每项可写 `vision`、`thinking`、`efforts`（`false` 或档位数组）、`contextWindow`。 |
 
-按模型的 `models` 覆盖（键为 `provider/model`）用于确认自动检测结果，配置者拥有最终决定权：
+关键词默认值：
+
+```yaml
+complexKeywords: [重构, 架构, 设计, 调试, 排查, 迁移, 性能, 并发, 安全,
+                  refactor, design, debug, migrate, optimize, rewrite,
+                  从零, from scratch, 实现, implement]
+heavyKeywords:   [全部, 整个, 全量, 端到端, complete, entire, whole, all, full, end-to-end]
+simpleKeywords:  [读, 查, 看, 列, 搜, 找, 读取, 显示, read, show, list, print, cat]
+trivialKeywords: [谢谢, 好的, 收到, 明白, ok, okay, thanks, 继续, 接着, next, continue]
+```
+
+配置示例：
 
 ```yaml
 config:
   level: auto
-  models:
-    llm-pi-ai/Qwen3.6-35B-A3B:   # 非 effort 思考模型（思考开关 + budget）
-      vision: false
-      thinking: true
-      efforts: false             # 永不发送 reasoning_effort（请求时剥离）
-    llm-pi-ai/Qwen3.8-27B:       # effort 模型（rc.6 时代适配器没有 low）
-      efforts: [low, high]       # 确认 low → 选择器展示 + 透传
+  allowDowngrade: true
+  allowUpgrade: true          # 复杂任务允许上 max
+  hysteresisSteps: 2
+  safeFallback: high
+  difficulty:
+    complexKeywords: [重构, 架构, refactor, 从零, implement]
 ```
 
-> 对 Qwen 思考开关 + budget，请配置 **llm-pi-ai** 路由：
-> `compat.thinkingFormat: qwen`（→ 线缆 `enable_thinking` + `thinking_budget`，经
-> `thinkingBudgets`），或 `qwen-chat-template`（→ `chat_template_kwargs.enable_thinking`）
-> 用于 Qwen3.8-27B 这类 effort 模型。
+上游原有字段 `takeover`、`takeoverUi`、`defaultPricing` 原样保留；它们与调度正交，文档见上游项目。
 
-默认值：`{ enabled: true, level: 'auto', allowDowngrade: true, allowUpgrade: false, models: {} }`。
+### 手动覆盖
 
-> 语义说明：模型选择器选择优先于插件默认档位。选 `auto`（mask）→ 插件调度；选线缆档位 → 直接生效；未选择 → 使用插件的 `level` 默认档位。`allowDowngrade` / `allowUpgrade` 只约束 `auto` 调度。
+模型选择器的选择永远压过调度器：选 `off`、`on`、`minimal`、`low`、`medium`、`high`、`xhigh` 或 `max`，
+就用这个线上档位。单条消息也能强制——写 `[effort: low]`、`[effort: high]` 或 `[effort: max]`
+（方括号可省，大小写不敏感），该请求直接绕过难度判定。
 
-## 第三方传输层接管（三协议）
+## 难度算法
 
-设置卡的「第三方接管」开关把一条路由加进 `dsh-llm-openai-completions` 传输层的
-`providers` 名单。**传输层的名字是历史遗留**——自 4.4.x 线起它已接管三种线缆协议：
-`openai-completions`、`openai-responses` 与 `anthropic`。路由被接管后，其模型请求短路
-走该传输层（多模态真发 + 模态门禁 + 提示词注入），pi-ai 不再参与。
+### 输入
 
-逐档线上值编辑器（`reasoningEfforts`）自 4.4.4 起**协议中立**：宿主把该表折成 pi-ai 的
-`thinkingLevelMap`，三种协议都读（Anthropic thinking budget、Responses reasoning effort、
-completions `reasoning_effort` 字符串）。两个 completions 专属 compat 开关（`支持 think
-effort` / `思考格式`）**只在 `openai-completions` 路由上渲染**——其他协议下写入会被宿主
-整体拒收，故 DOM 中不出现。
+| 输入 | 来源 | 说明 |
+|---|---|---|
+| `message` | 本轮最新用户消息 | 截断到 4000 字符；多段 text 拼接 |
+| `attachments` | 本轮附件数 | 只计数量，不读内容 |
+| `priorErrors` | 本轮工具结果 | 带 `error` / `isError` 的结果 |
+| `toolCount` | 本轮工具调用数 | 全部调用，不只是抽样窗口里的 |
 
-> **toggle 折叠陷阱（4.4.5 已修复）。** 思考模型选择器被折成 Off/On 是 `openai-completions`
-> 专属行为：当一条路由被接管**且**模型带 `reasoningEfforts` 表**但**没有
-> `compat.supportsReasoningEffort: true` 时触发。该折叠的存在理由是 pi-ai 拒收七固定档之外的
-> `reasoning_effort` 字符串——一个 completions 线缆层面的问题。Responses/Anthropic 路由的档位
-> 走原生映射（thinking budget / reasoning-effort 枚举），且 `supportsReasoningEffort` 根本无法写入，
-> 故 4.4.4 及之前把这类路由接管后会误将多档表折成 Off/On。自 4.4.5 起折叠额外要求路由 `api` 为
-> `openai-completions`（或缺省），被接管的 Responses/Anthropic 路由端到端保留完整档位集。
+### 第一步：显式标记优先
 
-## 官方 compat 面：短路工具退役（0.7.0-beta.1）
+消息里出现带括号的 `effort` 标记——`[effort: high]`、`{effort=max}`、`【EFFORT = low】`——且值是
+`off`、`low`、`high`、`max` 之一时，判定立刻结束：难度记为 `explicit`、分数 `1.0`，并采用消息要求的档位。
 
-自定义网关（vLLM / LM Studio / 自建 OpenAI 兼容代理）**声明思考功能后**，本插件自动把修复写入 **dsh 官方 `llm-pi-ai` compat 面**（dsh ≥ **v0.1.0-rc.8** 引入，commit `884f7b9c41`）——若仅为 developer 角色 400 修复，[dsh-llm-openai-completions](https://github.com/drscrewdriver/dsh-llm-openai-completions) 已不再需要、应保持卸载；只有当你明确要用它的三协议接管（见上节）时才安装：
+### 第二步：按消息长度给基础分
 
-- 扫描 `llm-pi-ai.providers`，识别「自定义网关 **且** 任一模型（含 `modelOverrides`）声明 `reasoningEfforts` 表」的路由，自动写入：
-  - 路由级 `compat.supportsDeveloperRole: false`——系统提示词按 `system` 角色发送，修复 vLLM / SGLang 的 `Unexpected message role` 400；
-  - toggle 型思考模型（思考表存在、行级无 `supportsReasoningEffort`）自动补模型级 `compat.thinkingFormat: 'qwen-chat-template'`——pi-ai 发 `chat_template_kwargs.enable_thinking`（裸 vLLM 忽略顶层 `enable_thinking`）；
-- 写入走官方设置通道（读 → 纯变换 → 整段 `settings.update('llm-pi-ai', …)`），dsh 的 schema 在**写入处**校验：低于 rc.8 的 dsh 会拒绝并日志告警，绝不静默错配；任何层级的显式值（true/false、已声明格式）永不覆盖；
-- 触发时机：插件启动、`llm/adapters-updated`、`llm-pi-ai` 的 settings 变化——无需手动改配置；
-- 响应侧的内联 `<think>` 拆分是**网关职责**：裸 vLLM 请加 `--reasoning-parser qwen3`（pi-ai 只解析 `reasoning_content` / `reasoning` / `reasoning_text`）。
+`len` 取消息去掉首尾空白后的长度。
 
-# 依赖说明
+| `len` | 基础分 |
+|---|---|
+| `< 8` | `0.05` |
+| `< 30` | `0.15` |
+| `< 80` | `0.30` |
+| `< 200` | `0.45` |
+| `< 500` | `0.60` |
+| `≥ 500` | `0.75` |
 
-插件 host 侧**不**值依赖 `@deepseek-ai/dsh-settings`——DSH 0.1.7 起不再有任何设置注册：设置表单由宿主按插件声明的 schemastery schema（`.volatile()` 字段）生成，客户端通过 dsh 运行时提供的 `configForms` 服务协作。无需在 profile 中手动安装官方包。`dependencies` 仅 `@deepseek-ai/schemastery`（随包自动安装）。
+命中记为 `len:<n>`。
+
+### 第三步：关键词类别
+
+大小写不敏感的子串匹配。权重每类只加一次（「这是个重构任务」是一个信号，不是三个），但命中的每个词都会记进
+`reasons[]`。
+
+| 类别 | 效果 | 理由标签 |
+|---|---|---|
+| complex | `score = max(score, 0.55)`，再 `+0.10` | `kw:<词>` |
+| heavy | `+0.10` | `kw:<词>` |
+| simple | `score × 0.7` | `kw:<词>` |
+| trivial | 仅当 `len < 60`：`score = min(score × 0.3, 0.2)` | `kw:<词>` |
+
+### 第四步：结构信号
+
+| 信号 | 判定 | 效果 | 理由标签 |
+|---|---|---|---|
+| 代码块 | 含 ``` 围栏 | `+0.15` | `code-block` |
+| 堆栈/报错 | 粘上来的报错指纹（`traceback`、`error:`、`exception`、源码帧、`panic`） | `+0.20` | `stack-trace` |
+| 文件路径 | 出现源码扩展名（`ts`、`tsx`、`js`、`jsx`、`py`、`go`、`rs`、`java`、`json`、`yaml`、`toml`、`md`、`sql`） | `+0.10` | `file-path` |
+| 短问句 | 以 `?` 或 `？` 结尾且 `len < 60` | `× 0.8` | `short-question` |
+
+### 第五步：上下文信号
+
+| 信号 | 条件 | 效果 | 理由标签 |
+|---|---|---|---|
+| 附件 | `attachments > 0` | `+0.05` | `attachments` |
+| 工具多 | `toolCount ≥ 6` | `+0.10` | `tool-count` |
+| 工具报错 | `priorErrors ≥ 1` | `+0.15` | `tool-error` |
+| 反复报错 | `priorErrors ≥ 3` | 再 `+0.10` | `tool-error:repeated` |
+
+### 第六至七步：收敛与分档
+
+分数先 clamp 到 `[0, 1]`，再分档：
+
+| 分数 | 难度 |
+|---|---|
+| `< 0.25` | `trivial` |
+| `< 0.45` | `simple` |
+| `< 0.70` | `moderate` |
+| `≥ 0.70` | `complex` |
+
+### 难度 → 基准档位
+
+| 难度 | 基准档位 |
+|---|---|
+| `trivial` | `low` |
+| `simple` | `low` |
+| `moderate` | `high` |
+| `complex` | `allowUpgrade` 打开时 `max`，否则 `high` |
+| `explicit` | 直接注入消息要求的档位（绕过调度器） |
+
+### 工具修正（只看本轮）
+
+本轮样本至少 2 条时，基准档位才可能被微调——不会低于 `low`、不会高于 `max`，方向受两个开关约束：
+
+| 条件 | 结果 |
+|---|---|
+| 简单工具占比 ≥ 75%（参数小）、`allowDowngrade` 打开、基准是 `high` | `low` |
+| 最大工具参数 ≥ 3200 字符、`allowUpgrade` 打开 | `max`（与降档同时命中时以它为优先） |
+| 样本不足 2 条 | 基准档位不变 |
+
+### 迟滞
+
+调度器记住该会话上一次发出的档位。不同档位要在连续 `hysteresisSteps` 次请求里被提出才会被采纳；与当前
+档位一致的一次决策会取消待定候选，所以 `high`/`low` 交替出现时永远不会切档。每个会话的第一次决策直接生效。
+想要纯粹的逐请求行为，把 `hysteresisSteps` 设为 `1`。
+
+### 一个算例
+
+`帮我重构 src/auto-schedule-projection.ts 的缓存层，附上报错：TypeError at index.ts:42`
+
+- 长度约 70 → 基础分 `0.30`
+- 命中 complex（`重构`）→ `max(0.30, 0.55) + 0.10 = 0.65`
+- `file-path` → `0.75`，`stack-trace` → `0.95`
+- clamp 后 `0.95` → `complex` → `max`（`allowUpgrade` 打开时），否则 `high`
+- 理由：`['len:70', 'kw:重构', 'file-path', 'stack-trace']`
+
+## 本 fork 改了什么
+
+1. **难度来自 prompt。** 分类器先读本轮最新用户消息；工具历史只是修正项，不再当主信号。
+2. **按轮次隔离。** 工具样本按 turn 切窗，新提问到来即清空，长会话不会把上一轮的「便宜」或「沉重」带进下一题。
+3. **兜底方向安全。** 投影读取失败或解析失败落到 `high`（`safeFallback` 可配），而不是掉到 `low`。
+4. **Clamp 就近向下。** 模型没广告目标档位时，AUTO 路径往最近的更低档找，而不是跳到最高档。
+5. **迟滞防抖。** `hysteresisSteps`（默认 2）让线上档位不会在相邻请求间来回跳。
+6. **工具名适配 Windows。** `pwsh`、`shell`、`powershell`、`apply_patch` 与 Unix 系工具名一样被认作简单工具。
+7. **自定义 wire 档位保留。** 用户选的档位若映射到自定义 wire 值（例如 `ultra`），原样透传，不被归一化吞掉。
+8. **决策可解释。** 每次决策都把 `reasons[]`（`len:`、`kw:`、`code-block`、`stack-trace`、`tool-error` 等）
+   带进日志，档位出乎意料时能追到是哪个信号推高了它。
+
+## 已知限制
+
+- **本质是启发式。** 长度与关键词阈值会把「很长但很简单」的 prompt 读成 `moderate` 或 `complex`。
+  猜错时调关键词、钉死档位，或用 `[effort: …]` 标记。
+- **默认词表是中英双语。** 其他语言只有在你补充关键词之后才能命中。
+- **只看文本。** 附件只贡献 `+0.05`，内容不参与分类。
+- **每轮最多 8 条样本。** 工具修正最多看本轮最后 8 次调用；`toolCount` 仍统计全部。
+- **迟滞有代价。** `hysteresisSteps: 2` 时，真正该跳的时候（比如报错风暴从 `low` 直上 `max`）要等两次决策才落地。
+- **调度器永不选 `off`。** 关思考只能手动选。
+- **宿主支持。** 模型完全不广告推理档位时，该字段根本不会发送；宿主没有会话投影时退回 `safeFallback`。
+- **从上游迁移。** 这是独立的包、独立的组合行，不会替换已安装的 `dsh-thinking-levels`；两个同时跑会争抢
+  `reasoningEffort`。先卸掉旧的。
 
 ## 开发
 
 ```bash
-npm run lint        # eslint（typescript-eslint flat config）
-npm run typecheck   # tsc --noEmit
-npm test            # vitest — 65 个测试
+pnpm install
+pnpm run typecheck
+pnpm run test
+pnpm run build          # tsc -> lib/，tsdown -> lib/client.js
 ```
 
-测试覆盖：档位策略（手动透传含扩展档位、`on` 钳制、auto 调度、档位校验、简单工具边界）、模型能力守卫（`reasoningEffortSupported`、`resolveEffortInjection` 剥离/透传）、会话事件解析（守卫、窗口截断、畸形记录）、配置 schema（默认值同步、越界拒绝、`models` 覆盖）、官方 compat 同步（识别、显式值尊重、身份幂等、写入处 schema 校验）。
+静态插件检查（依赖 dsh-plugin-guide，可选）：
 
-## 许可
+```bash
+node <path-to>/dsh-plugin-guide/bin/dsh-plugin-dev.js check --cwd .
+```
 
-MIT
+## 许可与致谢
 
-## 计价目录与账单（4.3.0+）
+MIT。本仓库 fork 自
+[`drscrewdriver/dsh-thinking-levels` 4.4.8](https://github.com/drscrewdriver/dsh-thinking-levels)，
+上游 MIT 原文逐字保留在 [LICENSE](./LICENSE)，并追加了我们的版权行；上游代码与本仓库新增部分的分界
+记录在 [NOTICE](./NOTICE)。
 
-账单逐笔在折入时刻按内置目录（src/price-catalog.ts）计价：29 个模型条目 × 地区。DeepSeek V4.1-Flash / V4-Flash / V4-Pro 采用官方峰谷双行（北京工作日 09:00-12:00、14:00-18:00 为峰；套用 2026 国务院节假日/调休修正表，补班周末按工作日计）；智谱 / Kimi / 通义千问 / 豆包 / MiniMax / 文心 为平价人民币档。每条目录含三价目位（每百万 token：非缓存输入 / 缓存命中输入 / 输出）并带复核日期与来源标注；币种随条目原样显示（¥ / $，不做汇率折算）。海外（USD）条目在核实通道到位前刻意留空。
-
-目录外模型走 defaultPricing 设置（cn / global / custom / off，缺省 off）：「off」时账单弹层显示"未计价"，token 计数照常——不再拿单一型号价静默估算。
-
-语义说明：改价/改策略只影响其后新记的账；升级后首次打开旧会话时，其累计账目会按当前目录一次性重折。
+感谢 drscrewdriver 的原始插件——宿主接线、客户端 UI 与 settings/volatile 配置管线都来自那里。
+内联的鲸鱼娘立绘是 `HanaAyane/dsh-reasoning-effort` 的社区二创，保留时标注了出处（见 [NOTICE](./NOTICE)）。
