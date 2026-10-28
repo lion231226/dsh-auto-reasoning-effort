@@ -1,6 +1,6 @@
 {
   "name": "dsh-auto-reasoning-effort",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Difficulty-driven reasoning-effort scheduler for DeepSeek Harness (dsh) — picks low / high / max per request from the task's difficulty instead of a fixed wire level. 按任务难度实时调节推理档位的 DSH 插件。",
   "repository": {
     "type": "git",

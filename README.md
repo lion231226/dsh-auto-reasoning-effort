@@ -206,10 +206,25 @@ one signal, not three), while every matched word is recorded in `reasons[]`.
 
 | Class | Effect | Reason tag |
 |---|---|---|
-| complex | `score = max(score, 0.55)`, then `+0.10` | `kw:<word>` |
+| complex | `score = max(score, 0.60)`, then `+0.10` | `kw:<word>` |
 | heavy | `+0.10` | `kw:<word>` |
-| simple | `score × 0.7` | `kw:<word>` |
-| trivial | only when `len < 60`: `score = min(score × 0.3, 0.2)` | `kw:<word>` |
+| action | `≥ 2` hits → `score = max(score, 0.70)`; exactly 1 hit with `len ≥ 40` → `max(score, 0.50)` | `act:<word>` |
+| orchestration | `≥ 1` hit with `len ≥ 40` → `score = max(score, 0.70)` | `orch:<word>` |
+| simple | `score × 0.7`, only when no expensive class fired | `kw:<word>` |
+| trivial | only when `len < 60` and no expensive class fired: `score = min(score × 0.3, 0.2)` | `kw:<word>` |
+
+**Action** words are the build/change verbs an instruction is made of (`新建`, `搭建`, `实现`, `发布`,
+`迁移`, `审查`, `修复`, `refactor`, `implement`, `publish`, …); **orchestration** words signal
+multi-agent or parallel intent (`subagents`, `并行`, `指导`, `监督`, `编排`, `端到端`, …). They exist
+because two such verbs in one sentence ("新建仓库…加入能力", "指导并监督 subagents") is a multi-hour
+job no matter how short the sentence is. Both tables ship as defaults; they are not exposed in the
+settings form yet.
+
+**Cheap words never veto expensive ones.** "Expensive" means any of: complex, heavy, an action floor,
+an orchestration floor. When one fired, the `simple` multiplier, the `trivial` multiplier and the
+short-question penalty are all skipped, and the suppressed hits stay visible in `reasons[]` as
+`kw:<word>(suppressed)`. This is why `好的，重构一下整个模块` stays `complex` instead of collapsing to
+`trivial`, and why `看看这个架构` keeps its `complex` floor.
 
 ### Step 4 — structural signals
 
@@ -218,7 +233,9 @@ one signal, not three), while every matched word is recorded in `reasons[]`.
 | code block | contains a ``` fence | `+0.15` | `code-block` |
 | stack trace | a pasted failure fingerprint (`traceback`, `error:`, `exception`, a source frame, `panic`) | `+0.20` | `stack-trace` |
 | file path | a source-file extension (`ts`, `tsx`, `js`, `jsx`, `py`, `go`, `rs`, `java`, `json`, `yaml`, `toml`, `md`, `sql`) | `+0.10` | `file-path` |
-| short question | ends with `?` or `？` and `len < 60` | `× 0.8` | `short-question` |
+| several paths | two or more *distinct* paths in one message | another `+0.10` | `paths:<n>` |
+| step list | two or more numbered/bulleted lines | `+0.15` | `steps:<n>` |
+| short question | ends with `?` or `？` and `len < 60`, only when no expensive class fired | `× 0.8` | `short-question` |
 
 ### Step 5 — context signals
 
@@ -312,8 +329,10 @@ behavior.
 - **Hysteresis has a cost.** With `hysteresisSteps: 2`, a genuine jump (say `low` → `max` for an
   error storm) takes two decisions to land.
 - **The scheduler never picks `off`.** Disabling thinking is a manual choice only.
-- **Host support.** Models that advertise no reasoning effort never receive the field; hosts
-  without the session projection fall back to `safeFallback`.
+- **Host support.** Models that advertise no reasoning effort never receive the field. Sessions the
+  projection registry does not serve — in-process subagents, most notably — are still classified: the
+  plugin captures the human prompt from `agent/pre-step` and only falls back to `safeFallback` when
+  neither source carries text (a goal-continuation round, a cron trigger).
 - **Upgrading from upstream.** This is a separate package and a separate composition row; it does
   not replace an installed `dsh-thinking-levels`, and running both would fight over
   `reasoningEffort`. Remove the old one first.

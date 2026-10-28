@@ -279,3 +279,35 @@ safeFallback: z.union(['low', 'high', 'max']).default('high').volatile(),
 - 上游 `src/index.ts` 里 `advertiseAutoEffort` 的 adapter 包装是否需要同步改（若 `resolveCallFor` 会校验 efforts，需放行 `auto`）。
 - 上游 `session-events.ts` 的 legacy 读法是否保留（我倾向于保留，只加新逻辑）。
 - `takeover` / `defaultPricing` / `billing-projection` 是否保留（我倾向于保留，它们与难度调度正交，但**不得**因此扩大改动范围）。
+
+## 10. v0.1.1 追加（上线实测后的校准，覆盖 §2.3/§5.2 中相冲突的数值）
+
+实测：16 条真实 prompt 里，「我们改成自己发布的插件…新建仓库…加入能力」= 0.300/simple→low，
+「作为 lead…指导并监督 subagents 执行」= 0.300/simple→low。结论是词表只认名词型难词，缺动作/编排信号。
+
+### 10.1 难度信号扩展
+- `DifficultyConfig` 新增**可选** `actionKeywords` / `orchestrationKeywords`（有冻结默认表；
+  目前不从 settings 暴露，保持 schema 兼容）。
+- 地板规则（在 §2.3 关键词之后、结构信号之前）：
+  - `actionHits ≥ 2` → `score = max(score, 0.70)`，reasons `act:<词>`；
+  - `actionHits === 1 && len ≥ 40` → `max(score, 0.50)`；
+  - `orchHits ≥ 1 && len ≥ 40` → `max(score, 0.70)`，reasons `orch:<词>`。
+- 结构信号新增：步骤清单（≥2 行 `^\S*?(?:\d+[.、)]|[-*])\s+`）→ `+0.15`（`steps:<n>`）；
+  去重后 ≥2 个文件路径 → 再 `+0.10`（`paths:<n>`）。
+- complex 地板由 0.55 调整为 **0.60**（`0.60 + 0.10 = 0.70` → complex）。
+- 抑制范围：`expensive = complex || heavy || action 地板 || orch 地板`；命中时跳过
+  simple ×0.7、trivial ×0.3、short-question ×0.8，reasons 标 `(suppressed)`。
+
+### 10.2 prompt 来源三级兜底（覆盖 §5.2 的"投影失败即 safeFallback"）
+`agent/pre-step`（waterfall，必须 `next()`）捕获每股 agent 的最后一条 `source.kind === 'user'` 消息文本，
+存 `WeakMap<agent, string>`；之后每个请求按顺序取：
+1. `projection.latestUserText`（非空）→ `src=projection`；
+2. pre-step 缓存（非空）→ `src=pre-step`（子代理会话走这条）；
+3. 都没有 → `safeFallback`，reasons `no-prompt`，`src=no-prompt`，每会话 warn 一次。
+
+`humanPromptOf` 的三态语义必须保持：`undefined`（本批无人类消息）→ 沿用上一轮缓存；
+`''`（有人类消息但无文本，如纯图片）→ **覆盖**缓存，避免上一轮文本泄漏。
+
+### 10.3 验收基准
+`tests/fixtures/prompts.zh.json` 16 条，**必须 16/16 命中**；分布 trivial 9 / simple 2 / complex 5。
+该 fixture 是回归门禁：任何改动导致分布变化都要先解释，再决定是否改靶子。

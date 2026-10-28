@@ -189,10 +189,23 @@ config:
 
 | 类别 | 效果 | 理由标签 |
 |---|---|---|
-| complex | `score = max(score, 0.55)`，再 `+0.10` | `kw:<词>` |
+| complex | `score = max(score, 0.60)`，再 `+0.10` | `kw:<词>` |
 | heavy | `+0.10` | `kw:<词>` |
-| simple | `score × 0.7` | `kw:<词>` |
-| trivial | 仅当 `len < 60`：`score = min(score × 0.3, 0.2)` | `kw:<词>` |
+| action | 命中 `≥ 2` 个 → `score = max(score, 0.70)`；恰好 1 个且 `len ≥ 40` → `max(score, 0.50)` | `act:<词>` |
+| orchestration | 命中 `≥ 1` 个且 `len ≥ 40` → `score = max(score, 0.70)` | `orch:<词>` |
+| simple | `score × 0.7`，仅在没有任何"昂贵"类别命中时生效 | `kw:<词>` |
+| trivial | 仅当 `len < 60` 且没有"昂贵"类别命中：`score = min(score × 0.3, 0.2)` | `kw:<词>` |
+
+**动作词（action）** 是一句指令里"要动手做什么"的动词（`新建`、`搭建`、`实现`、`发布`、`迁移`、
+`审查`、`修复`、`refactor`、`implement`、`publish`…）；**编排词（orchestration）** 表示多智能体/并行
+意图（`subagents`、`并行`、`指导`、`监督`、`编排`、`端到端`…）。它们存在的理由：一句话里出现两个动作
+词（"新建仓库…加入能力"、"指导并监督 subagents"）就是几小时的工程，句子再短也不该按闲聊算。两张表随
+包内置，暂未暴露到设置表单。
+
+**廉价信号不得否决昂贵信号。** "昂贵"指：complex、heavy、动作词地板、编排词地板任一命中。此时
+`simple` 乘 0.7、`trivial` 乘 0.3、短问句乘 0.8 全部跳过，被抑制的命中仍以 `kw:<词>(suppressed)`
+留在 `reasons[]` 里。这就是为什么 `好的，重构一下整个模块` 不会被"好的"压成 `trivial`，
+`看看这个架构` 也不会被"看"拉下 `complex` 地板。
 
 ### 第四步：结构信号
 
@@ -201,7 +214,9 @@ config:
 | 代码块 | 含 ``` 围栏 | `+0.15` | `code-block` |
 | 堆栈/报错 | 粘上来的报错指纹（`traceback`、`error:`、`exception`、源码帧、`panic`） | `+0.20` | `stack-trace` |
 | 文件路径 | 出现源码扩展名（`ts`、`tsx`、`js`、`jsx`、`py`、`go`、`rs`、`java`、`json`、`yaml`、`toml`、`md`、`sql`） | `+0.10` | `file-path` |
-| 短问句 | 以 `?` 或 `？` 结尾且 `len < 60` | `× 0.8` | `short-question` |
+| 多文件路径 | 一条消息里出现 **≥ 2 个不同**路径 | 再 `+0.10` | `paths:<n>` |
+| 步骤清单 | ≥ 2 行编号或项目符号 | `+0.15` | `steps:<n>` |
+| 短问句 | 以 `?` 或 `？` 结尾且 `len < 60`，仅在无"昂贵"类别命中时生效 | `× 0.8` | `short-question` |
 
 ### 第五步：上下文信号
 
@@ -280,7 +295,9 @@ config:
 - **每轮最多 8 条样本。** 工具修正最多看本轮最后 8 次调用；`toolCount` 仍统计全部。
 - **迟滞有代价。** `hysteresisSteps: 2` 时，真正该跳的时候（比如报错风暴从 `low` 直上 `max`）要等两次决策才落地。
 - **调度器永不选 `off`。** 关思考只能手动选。
-- **宿主支持。** 模型完全不广告推理档位时，该字段根本不会发送；宿主没有会话投影时退回 `safeFallback`。
+- **宿主支持。** 模型完全不广告推理档位时，该字段根本不会发送。投影注册表不服务的会话（最典型的是进程内
+  subagent）**仍然会被判定**：插件从 `agent/pre-step` 捕获人类 prompt，只有在两个来源都没有文本时（goal
+  续轮、cron 触发）才退回 `safeFallback`。
 - **从上游迁移。** 这是独立的包、独立的组合行，不会替换已安装的 `dsh-thinking-levels`；两个同时跑会争抢
   `reasoningEffort`。先卸掉旧的。
 

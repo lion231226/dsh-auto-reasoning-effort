@@ -6,6 +6,39 @@ unless a behavioral detail needs a second sentence.
 Upstream history (4.4.8 and earlier) lives in the project this fork started from:
 <https://github.com/drscrewdriver/dsh-thinking-levels/blob/main/CHANGELOG.md>.
 
+## [0.1.1] — 2026-10-28
+
+Calibration release: real prompts showed the classifier reading multi-hour build instructions as
+`simple`/`low`, and subagent sessions were never classified at all.
+
+### Added
+
+- **Action keywords** (`actionKeywords`): build/change verbs (`新建`, `搭建`, `实现`, `发布`, `迁移`,
+  `审查`, `修复`, `refactor`, `implement`, `publish`, …). Two hits floor the score at 0.70; one hit
+  with `len ≥ 40` floors it at 0.50.
+- **Orchestration keywords** (`orchestrationKeywords`): multi-agent/parallel intent (`subagents`,
+  `并行`, `指导`, `监督`, `编排`, `端到端`, …). One hit with `len ≥ 40` floors the score at 0.70.
+- **Structural signals**: a step list (≥ 2 numbered/bulleted lines) adds `+0.15`; two or more distinct
+  file paths add another `+0.10`.
+- **Subagent sessions are classified.** `agent/pre-step` captures the human prompt per agent, so a
+  session the projection registry does not serve still gets a difficulty decision instead of the hub.
+- **Regression fixture** `tests/fixtures/prompts.zh.json`: 16 real prompts with expected bands,
+  asserted by the scheduler suite (16/16).
+
+### Changed
+
+- complex-keyword floor `0.55` → `0.60`, so a short `重构这个模块` reaches `complex` (0.70) instead of
+  `moderate`.
+- Cheap signals (`simple` ×0.7, `trivial` ×0.3, short-question ×0.8) are skipped whenever an expensive
+  class fired; suppressed hits stay in `reasons[]` as `<tag>(suppressed)`.
+- `planRequestEffort` takes a prompt plus optional turn counters instead of requiring the projection.
+- Prompt provenance is logged as `src=projection` / `src=pre-step` / `src=no-prompt`.
+
+### Fixed
+
+- Subagent requests went out at `safeFallback` regardless of their own instruction; they now follow
+  the same difficulty policy as the main agent.
+
 ## [0.1.0] — 2026-10-28
 
 First release of this fork. The package, the repository and the composition row are
