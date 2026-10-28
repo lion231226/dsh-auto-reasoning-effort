@@ -1,0 +1,286 @@
+# 変更履歴
+
+`dsh-thinking-levels` の主な変更を記録します。
+
+- [English changelog](./CHANGELOG.md)
+- [日本語 changelog](./CHANGELOG.ja.md)
+- [한국어 changelog](./CHANGELOG.ko.md)
+- [Changelog en français](./CHANGELOG.fr.md)
+- [Changelog auf Deutsch](./CHANGELOG.de.md)
+- [Changelog in italiano](./CHANGELOG.it.md)
+- [Список изменений на русском](./CHANGELOG.ru.md)
+- [Changelog en español](./CHANGELOG.es.md)
+
+## [4.4.8] — 2026-10-27（二重マニフェストの同串修正）
+
+- 4.4.7 では `package.json` だけを更新し、`dsh.plugin.json` の `version` は 4.4.6 のままだったため、4.4.8 で両方を `4.4.8` に揃えました。ランタイムの挙動は 4.4.7 と同一です。
+
+## [4.4.7] — 2026-10-27（auto レベルが実際に機能 — サンプリングを projection に変更 + ホストのエコーを遮断 — issue #6）
+
+### Fixed
+- `auto` が常に `low` に落ちることがなくなりました。ツールサンプリングは `agent.session.events` を読んでいましたが、この配列プロパティはホスト 0.1.0-rc.8 にのみ存在し（0.1.2-rc.1 で削除）、対応する 14 ライン中 13 ラインでサンプルが常に `[]` となり `high` / `max` が構造的に到達不能でした。`tlAutoSchedule` projection を登録し、`apply` が `tool/call` を容量 8 のリングに畳み込み、ホストは `stateOf()` で O(1) 読み出します。初回読み出しでメモリ上のログ全体を fold するため、再開・分岐セッションでも完全です。ホストは `eventAt` / `snapshotEvents` / `ownEvents` の新規プロダクション呼び出しを禁じているため、旧読み出しには戻しません。
+- `auto` がセッション最初のリクエストだけで効く問題を修正しました。ホストは毎回、直前の `request/header` の `reasoningEffort`（= このプラグイン自身の注入値）を次リクエストのシードにします。旧実装はそれを「手動選択」とみなして素通ししたため、レベルが初回の決定に固定されていました。同じ projection が `model/selection` イベントを畳み込んでセッションの明示選択を取得します（このイベントの唯一のプロダクション書き込み元はユーザーの選択コマンドであり、プラグインの注入は書き込みません）。シードは手動/自動の判定に一切関与しません — エコーが構造的に消え、前回の注入値を覚える必要もなく、resume / fork / 圧縮後も正しく動作します。
+- レベルの優先順位：セッション内の明示選択 > プラグイン設定 `level` > スケジューラ。
+- 0.1.0-rc.8 の既知の制限：このラインの登録面には `stateOf` がない（旧プレーン契約）ため projection 登録をスキップし、`session.events` の旧経路を維持します — サンプリングは正常ですがエコー修正は適用されません。
+
+### Tests
+- 215/215：projection reducer・能力ゲート・schema 寛容性のケースを追加。`session-events.spec.ts` を**デコイ固定具**に書き換え（同一オブジェクトに旧 `events` 配列と projection 状態を同時に与え、projection が優先されることを断言）、4 リクエストのエコーシミュレーションを追加（初回 `low` → 高負荷 `max` → 明示選択がスケジューリングを抑止）。
+
+## [4.4.4] — 2026-10-21（互換フィールドを画面から外す・レベル表は全プロトコルで編集可 — issue #7 #8）
+
+- `支持 think effort` / `思考格式` の 2 スイッチは、他のプロトコルでは「無効化して長文の注記を出す」のをやめ、画面に出さないようにしました。表示条件は「思考モデルと宣言済み」かつ「ルートが openai-completions」の 2 つだけです。思考スイッチ自体は全プロトコルで有効のまま（protocol 非依存の `reasoningEfforts`）。
+- **レベル別 wire エディタは completions に閉じ込められなくなりました**（issue #8）。これは `reasoningEfforts` を編集するもので、ホストが pi-ai の `thinkingLevelMap` に変換し、全プロトコルが読みます（Anthropic の思考予算 / Responses の reasoning effort / completions の reasoning_effort 文字列）。思考モデルならどのプロトコルでもグリッドが開きます。completions の toggle 用ガード（effort 段を出す前に `支持 think effort` が必要）だけは従来どおりです。
+- `toggleEffortCapable` は非 completions のエントリを直接拒否します。
+- 修正：`applyDraft` は非 toggle の段をチェックすると `compat.supportsReasoningEffort: true` を自動書き込みしていました。Responses / Anthropic ではこのフィールドが原因でホストが **providers 全体を拒否**するため、1 クリックで保存が丸ごと失われていました。副作用を completions 限定にしました。
+- 残留検出（`staleThinkingCompatFields`）とワンクリック掃除（`stripThinkingCompat`）を追加。行単位・カード全体の両方から削除でき、兄弟の compat フィールドは保持、空になった `compat` は削除します。
+- テスト 180/180 グリーン（変異検証済み）。
+
+## [4.4.3] — 2026-10-21（思考は全プロトコルで設定可能 — issue #6）
+
+- 能力カード：思考チェックボックスが openai-completions 以外（Responses / Anthropic）でも再び選択可能に。書き込むのは protocol 非依存の `reasoningEfforts` で、ホスト llm-pi-ai が `reasoning: true` + `thinkingLevelMap` に解決し、pi-ai がプロトコルごとにネイティブ変換します（エフォート選択の前提）。
+- 非 completions の思考宣言に completions 専用の `thinkingFormat` を同梱しなくなりました（モデル階層への書き込みは providers 全体の拒否を招くため、qwen 形式の自動補完はスキップ）。`off` は実値（`none`）を保つため、Off が「未対応」扱いで消えることはありません。
+- `thinkingFormat` / 支持 think effort は従来どおり openai-completions 限定（実際に completions 専用の互換フィールド）。カードの注記もその旨に修正。
+- ホスト側の互換同期：明示的な非 completions `api` を「カスタム openai-completions ゲートウェイ」と判定しないように（baseURL 判定はプロトコル未指定時のみ）。
+- テスト 168/168 グリーン。
+
+## [4.4.2] — 2026-10-19（カードのトグル・可視説明 — ユーザーフィードバック）
+
+- 設定カードのチェックボックス（有効化／引継ぎマスター／レベル下げ／レベル上げ／モデルUI引き継ぎ）を楽観的な横置きピルトグルに変更（クリックで即時反転、書込拒否時はロールバック）。
+- モデルUI引き継ぎ行の下に常時表示の説明を追加（従来はツールチップのみ）：ON で何が置き換わり、OFF で何が残り、auto マスクはどちらでも提供され続けること。
+
+## [4.4.1] — 2026-10-19（takeoverUi 座席ウォッチドッグ — デスクトップ実測フィードバック）
+
+- 修正：`takeoverUi` がリロード不要で即時反映。4.4.0 はシート inject 時に設定ミラーを一度だけ読んでいたため、実機では設定チャネルのバインド／ミラー折り込みよりモデルシート呼出が先に走り、スイッチ ON でもパネルが着席しなかった（公式ポップアップのまま、コンテキストチップも消失）。着席判定はウォッチドッグ化され、設定ウェイストのバインドと各設定変更のたびに再評価されます。
+- カード：takeoverUi 行は楽観的な横置きピルトグルに（クリックで即反転、書込拒否時はロールバック）。
+
+## [4.4.0] — 2026-10-19（issue まとめ対応：#2 #3 #4 #5）
+
+### 修正
+- 能力カード（#2）：`api` が openai-completions 以外のプロバイダーでは、Thinking / Supports-effort / thinkingFormat のコントロールを説明付きで無効化。無効な書き込みによる `card.writeError` を解消（ホストの Responses 互換ゲートはこれらのモデルレベルフィールドを提供しません）。
+- 読み込みコスト（#4）：`resolveModel` 広告を冪等化（WeakSet ガード）。従来は `llm/adapters-updated` ごとにラッパーが積まれ、解決ごとに全量 settings 読み出しが発生していました。readout は世代キャッシュ化し、設定コミットで無効化。takeover ミラーの再同期は関連 namespace のコミットのみに実行。
+- 档位 chip（#5）：レベルが `auto` のとき chip は **Auto** を維持し、そのステップの解決値は `→ <level>` の二次表示に降格（表示が上書きされる問題の解消）。
+
+### 追加
+- `takeoverUi` 設定（既定 OFF、#3/#4）：公式モデルポップアップを維持（検索・読み込みはネイティブ、`auto` はサーバー側広告で引き続き提供）。OFF の間は公式モデルのコンテキスト編集は設定カードに。ON で ModelPanel 引き継ぎを復元。変更後はリロードが必要。
+- ModelPanel ポップアップの検索（#3）：4 モデル超で表示、公式の規則に準拠。
+
+## [4.3.1] — 2026-10-17（ホスト列挙の更新：0.2.1-rc.1 を追加）
+
+### Fixed
+- `engines.dsh` と 7 個の `@deepseek-ai/dsh-*` peer に `|| 0.2.1-rc.1` を追加（12 項目の正確な列挙、区間/caret 不使用）。ホスト互換ゲートが DSH `0.2.1-rc.1` を受け入れるようになります。
+- `dsh.plugin.json` の `engines.dsh` も同一の 12 項目列挙に統一（ゲートは `package.json` のみ読みますが、両リストは一致必須）。
+- devDependencies の `@deepseek-ai/dsh-client-*` を 0.2.0-rc.1 → 0.2.1-rc.1 に更新し、ビルドと全テスト（140 件）を対象ラインで検証。
+- README の互換記述（en/zh/ja/ko/de/es/fr/it/ru）を列挙に同期。動作変更なし。
+
+## [4.3.0] — 2026-10-17
+
+### 追加
+- 価格カタログ（src/price-catalog.ts）：29 モデル x 地域。DeepSeek V4.1-Flash / V4-Flash / V4-Pro は公式のピーク/オフピーク2段（北京 09-12・14-18 がピーク、2026-08-17 施行）、GLM / Kimi / Qwen / Doubao / MiniMax / Ernie は一律価格。各項目は百万トークンあたりの3価格（非キャッシュ入力 / キャッシュヒット入力 / 出力）を保持し、asOf と出典を明記。海外（USD）枠は構造上予約するも公式確認まで意図的に空（数値の捏造なし）。
+- defaultPricing 設定（cn / global / custom / off、既定 off）：カタログ外モデルは Flash 価格で估算せず「未計価」と表示。
+- 2026 国務院祝日/振替修正表（39 エントリ、dsh-session-guard と同源）：振替出勤の週末は平日としてピーク判定、法定祝日は終日オフピーク。表外年は週末のみの劣化動作。
+
+### 変更
+- プロジェクション stateVersion 1 -> 2：usage サンプルごとに確定時の計価レシートを state に永続化、同一 step 置換は記録値を減算（费率混在再計算と負値を排除）、会話/ターン集計は通貨別バケット。アップグレード直後に旧セッションは現行カタログで再折りたたみされ総額が一度変動、以降の設定変更は新規サンプルのみ影响。
+- 請求ポップオーバー：通貨別記号（¥ / $、不明は ISO コード）、flat/-null の正直な表示、「<model> で計価」はカタログ名から、混合通貨会話は合計せず通貨別行。
+
+### 修正
+- settings.describe() の形状正規化（進程内配列 vs RPC エンベロープ {namespaces:[...]}）：想定外形状は例外を投げず欠扱い（静默冻结クラスを解消）。
+- プロジェクション登録を try/catch で保護：請求单元的失败不再毒化插件整体或冷会话历史加载。
+
+## [4.2.1] — 2026-10-12
+
+### 変更 — stable への昇格（4.2.0-beta.29 からコード変更なし）
+
+- **4.2.0-beta 系を stable に昇格。** beta.18 → beta.29 の全内容（ファミリーセクショ
+  ンのクロスバージョン対応、タブ列の折り返し、旧 plugins ページカードの退役、
+  0.1.0-rc.8 コールドセッション修正）。`engines.dsh` は 11 ホスト系の列挙を維持し、
+  npm の `latest` チャネルはマルチライン stable を指すようになった。
+- **二重マニフェストの乖離を修正：** `dsh.plugin.json` が `4.2.0-beta.28` のまま
+  だった（beta.29 の bump もれ）→ 両マニフェストとも 4.2.1 に統一。
+
+## [4.2.0-beta.28] — 2026-10-08
+
+### 削除
+
+- **旧 plugins ページの項目カード（`settings.plugin.item`）を退役。** ≤0.1.5 の
+  plugins ページでファミリータブカードと重複していたため、起子插件設定
+  ファミリータブが全ホスト世代で唯一の設定面となった。
+
+## [4.2.0-beta.27] — 2026-10-08
+
+### 修正
+
+- **ファミリータブ列がコンテナ幅で折り返される**ように：tablist の
+  `flexWrap: 'nowrap'` + `overflowX: 'auto'`（063d9fd の単一行ストリップ設計）を
+  `wrap` に変更し、ボタンから `flex: 0 0 auto` を除去。contributor タブが 7+ に
+  増えても横スクロールバーではなく次の行に流れます（≤0.1.7 全世代）。
+
+## [4.2.0-beta.26] — 2026-10-08
+
+### 追加 — クロスバージョン・ファミリーセクション（beta.18 → beta.26）
+
+- **サーバー側レガシー設定セクション（`installLegacySection`）。** ファミリー
+  セクション（起子插件设置）は `thinking-levels` 名前空間をサーバー側で登録する
+  ようになり、3 世代の生成形態（モジュールレベル `installSettingsSection`、
+  インスタンス `installSection`、rc.1+ の loader-volatile）を横断してホスト
+  ≤0.1.7 で実データ付きで描画されます。非 volatile の素の `LegacyConfig` スキーマ
+  と、揺らぎを除去した素のベースを使用（volatile ノードもライブ ref もレガシー
+  register は拒否 — beta.18 → beta.22 で三重に積み重なったバグを修正）。
+- **ファミリーセクション選挙の強化（beta.26）。** `settings.section` ファクトリは、
+  `dsh-family` エントリーが既に着席済みなら（ホストネイティブ面や競合）退避します：
+  登録順序によらず所有者はちょうど 1 つ。dsh-session-guard 4.1.11 の遅延譲位選挙と
+  対応 — ≤0.1.7 シェルは同 ID の各セクションに固有のナビ行を与えるため、二重登録＝
+  二重の起子插件设置行でした。
+- **UI 修正（beta.23 → beta.25）。** ファミリータブ帯は 1 行に収まるよう横スクロール化
+  （8 枚の寄与タブが最後の 1 枚を第二行に孤立させない）；設定コントロールはシェルの
+  ダークテーマに追従（白のハードコードを半透明面に、`colorScheme` は body 輝度の
+  ワンショット計測から）；children 宣言は競合時に子なしで着地；ライフサイクルの
+  デバッグログは本番に保持。
+
+## [Unreleased]
+
+### 追加 — 思考レベルスライダー（鲸魚娘ランナーつまみ） — 4.1.0
+
+- 各行の思考レベル `<select>` をセグメントスライダーに改修：ストップ数はモデルの広告
+  レベルに追従、`auto` は常に最左、つまみはポインターに連続追従・リリースでスナップ、
+  ←/→/Home/End 対応、「プロバイダーの既定」リセットは ↺ ボタンとして存続。
+- DeepSeek 系の行は 8 フレームの側面ランニング立絵をつまみに採用（ピンポンループ、静止
+  720ms／ドラッグ中 420ms、`prefers-reduced-motion` で停止）。素材は
+  HanaAyane/dsh-reasoning-effort 提供、`python tools/whale-mascot.py` で再生成。
+- `thinking-level` に `orderEffortsForSlider` / `nearestEffortStopIndex` を追加（テスト付き）。
+
+## [4.0.0] — 2026-09-29
+
+### 変更 — DSH 0.2.0-rc 互換
+
+- **peer ゲートを 0.2.0-rc セグメントに再設定。** 7 件すべての `@deepseek-ai/dsh-*` peer 宣言と
+  `engines.dsh` を `>=0.2.0-rc.1 <0.2.1-0` に変更（旧 `>=0.1.7-rc.1 <0.1.8-0` から）。0.1.7-rc.1〜
+  <0.2.0 のホストは 3.x ライン（npm dist-tag `dsh-0.1.7`、3.4.3）を、0.1.7-rc.1 未満のホストは
+  3.0.2 を使用してください。
+- **devDependencies を 0.2.0 ラインへ移行** — `dsh-client-locale` / `dsh-client-ui-renderer` /
+  `dsh-client-ui-settings` / `dsh-client-ui-slots` / `dsh-client-store` → `0.2.0-rc.1`、および
+  `@deepseek-ai/cordis` → `^4.0.4`（0.2.0-rc.1 クライアントパッケージの `~4.0.4` peer 要件）——
+  これにより typecheck / テスト / ビルドが実際の 0.2.0-rc.1 型に対して実行されます。
+- **メタデータ整合：** `dsh.plugin.json` の version と `engines.dsh` を 4.0.0 と 0.2.0-rc セグメントに
+  同期；`publishConfig.tag` → `dsh-0.2.0` と新規 `release:4x` スクリプトで、公開が `dsh-0.1.7` /
+  `latest` タグを上書きしないことを保証；両 lockfile（`package-lock.json` / `pnpm-lock.yaml`）を
+  0.2.0 依存ツリーに対して再生成。
+- **host 側・client 側ともコード変更なし。** 本プラグインが import するパッケージ
+  （`dsh-client-locale`、`dsh-client-store`、`dsh-client-ui-renderer`、`dsh-client-ui-settings`、
+  `dsh-client-ui-slots`）は 0.1.7-rc.2 → 0.2.0-rc.1 間でパッケージバージョンのみ変動；
+  `settings` / `llm` サービス面と `llm-pi-ai` アダプタも未変更。全スイート
+  （lint / typecheck / 71 テスト / ビルド）が 0.2.0-rc.1 に対して無変更で通過。
+
+### 修正 — プラグイン設定の二重表示 — 2.0.0-beta.4
+
+- **`settings.plugins.tab` 登録を削除。** 0.1.5 互換作業では DSH 0.1.5 が `settings.plugin.item` スロットを廃止したと想定していましたが、リリース済みの 0.1.5-rc.2（および 0.1.6-alpha.1）の `ui-settings-plugins` は内蔵の設定タブの子として同スロットを維持しています。両スロットが宣言されているため 2 つの登録が同時に発火し、設定 → プラグインに項目カードと専用タブの 2 つが表示されていました。項目カードだけで全サポート線をカバーできるため、タブ登録（および `ctx.locale.bind` のラベル thunk）を削除しました。
+
+## [0.7.0-beta.1] — 2026-09-06
+
+> **ベータ版：ショートサーキット経路の廃止。** 本リリースは `dsh-llm-openai-completions`（および一切の transport 引き継ぎサイドパス）に依存しません。すべてのゲートウェイ修正は公式 `llm-pi-ai` compat 面（**dsh v0.1.0-rc.8** 以降で利用可能）に乗ります。
+
+### 削除
+- ショートサーキット引き継ぎブリッジを削除（`llm-openai-completions` リストの維持を停止）。アダプタープラグインは不要です。
+
+### 変更
+- 自動 compat ブリッジを公式 compat 面へ書き直し：ルートレベル `compat.supportsDeveloperRole: false` と、トグル型思考モデルへのモデルレベル `compat.thinkingFormat: 'qwen-chat-template'`（素の vLLM はトップレベル `enable_thinking` を無視するため）。
+- 能力カードからショートサーキットを排除：「ゲートウェイは developer ロール非対応」スイッチに置き換え、引き継ぎリストの門控を廃止し、思考＋視覚 → effort 対応 → effort エディタの段階的 UI に変更。
+- `declaresThinking` が `modelOverrides` も走査。
+
+### 備考
+- dsh ≥ v0.1.0-rc.8 が必要。応答側のインライン `<think>` 分割はゲートウェイ側の課題（vLLM は `--reasoning-parser qwen3`）。
+
+## [0.7.0] — 2026-08-30
+
+### 追加
+
+- **マルチレベル コンテキストウィンドウ プリセット**（モデル別能力エディター）：`64K / 128K / 256K / 400K / 512K / 1M` のプリセットボタンに加え、カスタム整数入力とクリアボタンを追加。`llm-pi-ai` モデルの `contextWindow` に書き込まれ、ハーネスが次のリクエストから再起動なしでライブに消費します（圧縮 / コンテキストオーバーフロー検出 / コンテキスト圧力予測）。
+- 新しい純粋モジュール `src/context-window.ts`（範囲定数 `2000`–`1_000_000`、プリセット一覧、`formatContextWindow`、`validateContextWindow`）を追加。設定スキーマ、設定カード、テストで共有されます。
+- 設定面：`models[].contextWindow` オーバーライドを整数 `2000`–`1000000` の検証付きで受け付けます（範囲外の値は fail-loud）。
+- コンテキストウィンドウコントロールの `zh` / `en` / `ja` / `ko` コピーを追加。
+
+### 変更
+
+- コンテキストバッジが共有の `formatContextWindow` を再利用するように変更。書き込まれたプリセットがそのまま表示されます（例：`256000` → `256K`、`1000000` → `1M`）。
+
+## [0.6.0] — 2026-02-?
+
+### 追加
+
+- **8 つの標準レベル**（dsh-thinking-effort に合わせて）：`off / on / minimal / low / medium / high / xhigh / max`（+ `auto` スケジューラーマスク）。`on` は思考有効化トグルで、モデルの既定強度（`high` または最高の宣言済み思考レベル）にクランプされます。`minimal` / `medium` / `xhigh` はカスタムゲートウェイが宣言していれば透過し、公式アダプターでは `high` に畳み込まれます。
+- **設定カードのカスタム送信値マッピング**（dsh-thinking-effort から借用）：各レベルにチェックを入れ、ゲートウェイに送信する値を入力（例：`high` → `ultra`）。`off` を空欄にすると送信されません。モデルの `reasoningEfforts` テーブルとして保存されます。
+- **設定カードの表示刷新**（dsh-thinking-effort から借用）：プロバイダーがモデルをグループ化し、各モデル行はテキスト/画像/コンテキストバッジを表示、モデルはレベル別エディターに展開、検索ボックスでモデルを絞り込み、ワンクリックプリセット（公式 DeepSeek 形式 / 汎用）を全思考モデルに適用。
+- **多言語対応**：日本語（`ja`）と韓国語（`ko`）の辞書、`README.ja.md` / `README.ko.md`、`INSTALL.{md,zh,ja,ko}.md`、`CHANGELOG.{md,ja,ko}.md`。注：公式 DSH の locale ランタイムはまだ `zh` / `en` のみ公開しているため、`ja` / `ko` の選択には DSH フォークが必要です（README の互換性注記を参照）。
+
+### 変更
+
+- `level` 設定面は 9 値すべてを受け付けます（`off | on | minimal | low | medium | high | xhigh | max | auto`）。
+- `models[].efforts` オーバーライドは拡張レベルを受け付けます。
+- カードレンダラーをリファクタリング。能力エディターは即時チェックボックスコミットではなく、明示的な「レベルを適用」ボタン付きのステージ型ワイヤードラフトを使用します。
+
+### 修正
+
+- 未使用ヘルパー `effortLevelsOf` を削除。レガシー `_N` 未使用パラメータの lint 警告を抑制。
+
+## [0.5.2] — 2026-02-?
+
+### 追加
+
+- **`dsh-llm-openai-completions` の自動引き継ぎ**：カスタム openai-completions ゲートウェイ（`api: openai-completions` または非公式 baseURL）**かつ** いずれかのモデルが `reasoningEfforts` テーブルを宣言する provider を `llm-openai-completions.providers` に `enabled: true` でマージ。プラグイン起動、`llm/adapters-updated`、設定変更時に実行。ソフト結合（名前空間未登録なら書き込みをスキップ）。
+
+## [0.5.1] — 2026-02-?
+
+### 追加
+
+- モデル能力エディターカード：すべてのカスタム `llm-pi-ai` プロバイダーモデルに視覚 / 思考 / effort サポート / effort レベル / 思考形式を提供し、`llm-pi-ai` 設定名前空間へ直接書き込み（公式パッケージの変更なし）。
+
+## [0.5.0] — 2026-02-?
+
+### 追加
+
+- モデル能力ガード：推論能力を宣言していないモデルに `reasoning_effort` を送信しない（Qwen3.6 などのカスタム openai-completions ルートは除去）。
+- dsh rc.7+ での `low` 透過。rc.6 時代のアダプターは構成者が確認した `models` オーバーライドで `low` を広告可能。
+- `models` 設定セクション（`provider/model` → `vision` / `thinking` / `efforts`）。
+
+## [0.4.1] — 2026-02-?
+
+### 修正
+
+- adapter `resolveModel` のラップが `llm/adapters-updated` で再実行されるようにし、アダプターがプラグイン適用後に登録されても `Auto` マスクが表示されるように。
+
+## [0.4.0] — 2026-02-?
+
+### 変更
+
+- `@deepseek-ai/dsh-settings` への値依存を撤廃。設定登録は cordis `settings` サービス経由（ローカルの `installSettingsSection` 相当）。
+- カード登録に `id` と `key` の両方を指定し、CLI（keyed）と DSH Desktop（list）の slot 宣言の両方で動作。
+
+## [0.3.0] — 2026-02-?
+
+### 追加
+
+- モデルセレクターの `Auto`（マスク）：adapter `resolveModel` の efforts に注入。プラグインが `agent/request` waterfall（`prepend` 登録）で `low` / `high` / `max` をステップごとにスケジュール。
+
+## [0.2.1] — 2026-02-?
+
+### 修正
+
+- `exports["./client"]` を追加し、dsh の client-modules ローダーが client bundle を発見できるように。
+
+## [0.2.0] — 2026-02-?
+
+### 追加
+
+- 最初の client 設定カード（レベルピッカー + スケジューラートグル）。
+
+## [0.1.1] — 2026-02-?
+
+### 修正
+
+- 生の TS ソースではなくコンパイル済み `lib/` を公開（Node 22 は `node_modules` 配下の `.ts` の type-stripping を禁止）。
+
+## [0.1.0] — 2026-02-?
+
+### 追加
+
+- 初回リリース：固定 reasoning effort の `agent/request` 注入。

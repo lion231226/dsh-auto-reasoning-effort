@@ -1,0 +1,851 @@
+/**
+ * dsh-thinking-levels host plugin: injects a user-selected or auto-scheduled
+ * `reasoning_effort` into every `agent/request` waterfall (levels: off / on /
+ * minimal / low / medium / high / xhigh / max / auto), and records per-tool
+ * wall-clock durations for telemetry.
+ *
+ * Model-aware since v0.5.0:
+ * - A model that does not advertise reasoning metadata (custom
+ *   openai-completions routes such as Qwen3.6 without `reasoningEfforts`)
+ *   NEVER receives a `reasoningEffort` — dsh rejects unsupported efforts per
+ *   request (UNSUPPORTED_REASONING_EFFORT). Unsupported fields are stripped.
+ * - Manual selections pass through unchanged, including `low` on dsh rc.7+
+ *   where the level is native. `on` (the enable-thinking toggle) is never a
+ *   wire level: on a toggle-only model it injects the advertised `high`
+ *   (serialized as enable_thinking, no reasoning_effort); elsewhere it is
+ *   stripped.
+ * - The auto scheduler never picks `low` (no surprise low injection).
+ * - On rc.6-era adapters (efforts without `low`) a configurer-confirmed model
+ *   override may advertise `low` so the selector shows it and the passthrough
+ *   is admitted by request validation.
+ *
+ * Extension points used (verified in deepseek-ai/deepseek-harness):
+ * - `agent/request` waterfall (packages/core/agent-loop/src/agent.ts
+ *   buildRequest): each listener may return a modified GenerateOptions for
+ *   the next listener — the sanctioned way to adjust request config.
+ * - `session.events` (agent.session) carried the step's tool/call records up to
+ *   host 0.1.0-rc.8 only; from 0.1.2-rc.1 on the log is read through the
+ *   projection registry instead (`tlAutoSchedule`, issue #6). The deprecated
+ *   synchronous readers (`eventAt/snapshotEvents/ownEvents`) are prohibited for
+ *   new production calls by `packages/core/session/README.md:62`.
+ * - The session's EXPLICIT effort pick is folded from `model/selection` events:
+ *   the host seeds `reasoningEffort` from the previous request header (this
+ *   plugin's own output), so the seed must never be read as a manual pick.
+ * - declarative settings (DSH 0.1.7+): the runtime-adjustable `Config` fields
+ *   are marked `.volatile()`, the host generates the settings form from the
+ *   schema alone, and the plugin reads the live values per request.
+ */
+import type { Context } from '@deepseek-ai/cordis'
+import type { Volatile } from '@deepseek-ai/cosmokit'
+import z from '@deepseek-ai/schemastery'
+import { assertEffortId, reasoningEffortSupported, resolveEffortInjection, type EffortId } from './thinking-level.ts'
+import { buildBillingDefinition, type PricingPolicy } from './billing-projection.ts'
+import { recentToolCalls } from './session-events.ts'
+import { buildAutoScheduleDefinition, readAutoSchedule, requestedEffortOf } from './auto-schedule-projection.ts'
+import { CONTEXT_WINDOW_MAX, CONTEXT_WINDOW_MIN } from './context-window.ts'
+import {
+  PI_AI_NAMESPACE,
+  TAKEOVER_NAMESPACE_CANDIDATES,
+  takeoverPatch,
+  takeoverRoutesOf,
+  withOfficialCompatFixes,
+  type PiAiSection,
+} from './takeover-sync.ts'
+import { describeSettings, readSection, readSectionOf, resolveNamespaceOf } from './settings-read.ts'
+
+/** One configurer-confirmed capability override for a `provider/model` key. */
+export interface ModelCapabilityOverride {
+  /** Manual override of the vision-model classification (auto: inputModalities). */
+  vision?: boolean
+  /** Manual override of the thinking-model classification. */
+  thinking?: boolean
+  /**
+   * Manual confirmation of the supported effort levels. `false` marks a
+   * non-reasoning model; a list names the levels the API accepts (rc.6-era
+   * adapters may then advertise missing ones, e.g. `low`). Absent keeps the
+   * adapter-advertised list.
+   */
+  efforts?: false | Exclude<EffortId, 'auto'>[]
+  /**
+   * Declared context-window limit in tokens (2000–1_000_000). Declaration-only:
+   * the runtime harness reads it from the llm-pi-ai model entry, so this
+   * override is a validated config-surface declaration.
+   */
+  contextWindow?: number
+}
+
+/** Plugin settings. */
+export interface ThinkingLevelsConfig {
+  /** On a DSH 0.1.7+ host the schema's `.volatile()` fields arrive as live refs — read them through `readVolatile`. */
+  enabled: boolean | Volatile<boolean>
+  /** User-selected level: off / on / minimal / low / medium / high / xhigh / max fix the wire level; `auto` schedules per step. */
+  level: EffortId | Volatile<EffortId>
+  /** Scheduler preference: allow dropping below the `high` hub. */
+  allowDowngrade: boolean | Volatile<boolean>
+  /** Scheduler preference: allow lifting above the `high` hub to `max`. */
+  allowUpgrade: boolean | Volatile<boolean>
+  /**
+   * Master takeover switch: mirrored into the openai-completions transport's
+   * own section (`llm-openai-completions.enabled`) when it flips. The
+   * transport's dispatch judgment stays single-source in ITS section; this
+   * flag is the control-layer UI for it.
+   */
+  takeover: boolean | Volatile<boolean>
+  /**
+   * UI takeover switch (issues #3/#4): false (default) keeps the official
+   * composer model popup — the `auto` mask still arrives through the adapter
+   * advertisement below, and the official popup keeps its native search.
+   * true seats the plugin's ModelPanel (which carries its own search box and
+   * the intent/resolved effort chip).
+   */
+  takeoverUi: boolean | Volatile<boolean>
+  /** Configurer-confirmed capability overrides, keyed `provider/model`. */
+  models: Record<string, ModelCapabilityOverride>
+  /**
+   * 目录外模型的计价兜底档（price-catalog 未命中时生效）：estimate/cn/global/custom/off。
+   * 缺省 estimate（典型价兜底估算，显示「未校准·仅供参考」）；off 才是真不计价；
+   * 目录内模型自动按条目地区计价，不受本项影响。
+   */
+  defaultPricing: PricingPolicy | Volatile<PricingPolicy>
+}
+
+const effortId = z.union(['off', 'on', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'])
+
+/** Per-model capability overrides — shared verbatim by both schema faces
+ * below (the two must never drift). */
+const modelsSchema = z.dict(z.object({
+  // schemastery fields are optional unless marked `.required()`.
+  vision: z.boolean(),
+  thinking: z.boolean(),
+  efforts: z.union([z.const(false), z.array(effortId)]),
+  contextWindow: z.number().step(1).min(CONTEXT_WINDOW_MIN).max(CONTEXT_WINDOW_MAX),
+})).default({})
+
+/** 计价兜底档：schemastery 枚举，两代 schema 共享（the two must never drift）。 */
+const defaultPricingSchema = z.union(['estimate', 'cn', 'global', 'custom', 'off']).default('estimate')
+
+/**
+ * Composition-entry schema: what a dsh profile may configure at assembly
+ * time (cordis.yml `config:` of the plugin row). The same schema doubles as
+ * the settings surface: DSH 0.1.7 renders the plugin's settings form from the
+ * `.volatile()` fields alone (no registration call), and hands `apply` the
+ * validated entry with those fields as live `Volatile` refs.
+ */
+export const Config = z.object({
+  enabled: z.boolean().default(true).volatile(),
+  level: z.union(['off', 'on', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'auto']).default('auto').volatile(),
+  allowDowngrade: z.boolean().default(true).volatile(),
+  allowUpgrade: z.boolean().default(false).volatile(),
+  takeover: z.boolean().default(false).volatile(),
+  takeoverUi: z.boolean().default(false).volatile(),
+  defaultPricing: defaultPricingSchema.volatile(),
+  models: modelsSchema,
+})
+
+/**
+ * Legacy (≤0.1.6) settings schema: the same fields WITHOUT the `.volatile()`
+ * ref wrappers. The imperative `settings.register` resolver reads schemas
+ * literally and rejects the 0.1.7 ref descriptors ("$.enabled expected
+ * boolean but got [object Object]", live on cell 0.1.5) — the 3.x compat
+ * branches shipped exactly this plain shape.
+ */
+export const LegacyConfig = z.object({
+  enabled: z.boolean().default(true),
+  level: z.union(['off', 'on', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'auto']).default('auto'),
+  allowDowngrade: z.boolean().default(true),
+  allowUpgrade: z.boolean().default(false),
+  takeover: z.boolean().default(false),
+  takeoverUi: z.boolean().default(false),
+  defaultPricing: defaultPricingSchema,
+  models: modelsSchema,
+})
+
+/** Settings defaults, kept in lockstep with the schema defaults above. */
+export const DEFAULT_CONFIG: ThinkingLevelsConfig = {
+  enabled: true,
+  level: 'auto',
+  allowDowngrade: true,
+  allowUpgrade: false,
+  takeover: false,
+  takeoverUi: false,
+  defaultPricing: 'estimate',
+  models: {},
+}
+
+/**
+ * The `loader/volatile-update` event is emitted by the DSH 0.1.7+ loader when
+ * a `.volatile()` config field changes (no plugin remount). The dev pins
+ * predate the event, so the signature is augmented here — mirroring the host
+ * runtime, which passes the changed config paths.
+ */
+declare module '@deepseek-ai/cordis' {
+  interface Events {
+    'loader/volatile-update': (paths: string[]) => void
+  }
+}
+
+/**
+ * Read a `.volatile()` field: a live `Volatile` ref on a DSH 0.1.7+ host, a
+ * plain value otherwise. `get()` may return undefined for an absent value, so
+ * the schema default is the fallback.
+ */
+export function readVolatile<T>(value: T | Volatile<T> | undefined, fallback: T): T {
+  if (value !== null && typeof value === 'object' && typeof (value as Volatile<T>).get === 'function') {
+    const snapshot = (value as Volatile<T>).get()
+    return (snapshot === undefined ? fallback : snapshot) as T
+  }
+  return (value as T | undefined) ?? fallback
+}
+
+/**
+ * The live configuration snapshot: the runtime-adjustable fields resolved to
+ * plain values (volatile refs read through).
+ */
+interface LiveConfig {
+  enabled: boolean
+  level: EffortId
+  allowDowngrade: boolean
+  allowUpgrade: boolean
+  takeover: boolean
+  takeoverUi: boolean
+  defaultPricing: PricingPolicy
+  models: Record<string, ModelCapabilityOverride>
+}
+
+/**
+ * Resolve the live configuration snapshot: the runtime-adjustable fields are
+ * read through their (possibly volatile) composition-entry values on every
+ * call, so a committed settings change applies to the next request without a
+ * plugin remount.
+ */
+function resolveLiveConfig(config: ThinkingLevelsConfig): LiveConfig {
+  return {
+    enabled: readVolatile(config.enabled, true),
+    level: readVolatile(config.level, 'auto'),
+    allowDowngrade: readVolatile(config.allowDowngrade, true),
+    allowUpgrade: readVolatile(config.allowUpgrade, false),
+    takeover: readVolatile(config.takeover, false),
+    takeoverUi: readVolatile(config.takeoverUi, false),
+    defaultPricing: readVolatile(config.defaultPricing, 'estimate'),
+    models: config.models,
+  }
+}
+
+/**
+ * The `auto` mask shown in the model directory: a user-facing level that is
+ * never sent to the API — the plugin resolves it to a wire level per request.
+ * It is injected into the adapter's `reasoning.efforts` so the model selector
+ * offers it, and `resolveCallFor` accepts it until this plugin's request
+ * interceptor substitutes the resolved wire level.
+ */
+const AUTO_EFFORT: { id: 'auto'; name: 'Auto' } = { id: 'auto', name: 'Auto' }
+
+/**
+ * The `low` level, advertised only for configurer-confirmed models whose
+ * adapter predates dsh rc.7 (efforts list without `low`). Advertising it makes
+ * the selector show Low and the harness request validation admit the
+ * passthrough; the adapter must serialize it (pi-ai openai-completions does,
+ * e.g. via `thinkingFormat: qwen` → enable_thinking + thinking_budget).
+ */
+const LOW_EFFORT: { id: 'low'; name: 'Low' } = { id: 'low', name: 'Low' }
+
+/** Minimal face of the llm service's adapter registrations (typed locally to avoid a host-package value import). */
+interface LlmRegistration {
+  adapter: {
+    resolveModel: (provider: string, model: string, signal?: unknown) => Promise<{
+      reasoning?: { efforts?: { id: string; name: string }[] }
+    }>
+  }
+}
+
+/**
+ * Adapters whose `resolveModel` is already wrapped — the per-adapter
+ * idempotence issue #4 proves was missing: re-running the advertisement on
+ * every `llm/adapters-updated` stacked a new wrapper per pass, and every
+ * stacked layer re-ran the post-processing on each resolveModel call.
+ * Keyed on the adapter object itself, so a genuinely new adapter is wrapped
+ * once and retired ones need no cleanup.
+ */
+const advertisedAdapters = new WeakSet<object>()
+
+/**
+ * Advertise `auto` (and, for configurer-confirmed rc.6-era models, `low`) in
+ * the model directory: wrap every registered adapter's `resolveModel` so the
+ * returned `reasoning.efforts` include the extra levels. Idempotent per
+ * adapter. `auto` is a mask the plugin resolves per request; `low` is only
+ * added when the model override confirms the level, so rc.7+ models (which
+ * already advertise low) and unconfirmed models stay untouched.
+ *
+ * A thinking model WITHOUT effort support (Qwen3.6-style, per the llm-pi-ai
+ * config: `reasoningEfforts` present but `compat.supportsReasoningEffort` not
+ * true) gets its selector collapsed to a plain On/Off toggle: `off` disables
+ * thinking, `on` maps to the `high` level, which pi-ai serializes as
+ * `enable_thinking: true` under `thinkingFormat: qwen`. No auto/low masks are
+ * offered for these — there is nothing to schedule.
+ * @param llm - the resolved `llm` service, when present.
+ * @param overrideFor - model override lookup, keyed `provider/model`.
+ * @param piAiFor - llm-pi-ai config capability lookup, keyed `provider/model`.
+ * (exported for the idempotence regression test, issue #4 — same precedent as
+ * `installLegacySection`)
+ */
+export function advertiseModelCapability(
+  llm: { adapters?: Map<string, LlmRegistration> } | undefined,
+  overrideFor: (provider: string, model: string) => ModelCapabilityOverride | undefined,
+  piAiFor: (provider: string, model: string) => { thinkingOn: boolean; supportsEffort: boolean } | undefined,
+): void {
+  for (const registration of llm?.adapters?.values() ?? []) {
+    const adapter = registration.adapter
+    // Issue #4: the re-run on every `llm/adapters-updated` must NOT stack
+    // wrappers — each stacked layer re-ran the post-processing (and a full
+    // describeSettings) on every resolveModel call. This WeakSet is the
+    // idempotence the JSDoc has always promised.
+    if (advertisedAdapters.has(adapter)) continue
+    advertisedAdapters.add(adapter)
+    const original = adapter.resolveModel.bind(adapter)
+    adapter.resolveModel = async (provider, model, signal) => {
+      const info = await original(provider, model, signal)
+      const reasoning = info.reasoning
+      if (reasoning === undefined) return info
+      const piCap = piAiFor(provider, model)
+      if (piCap?.thinkingOn === true && piCap.supportsEffort === false) {
+        // Toggle-only model (Qwen3.6 / mimo-v2.5 style): the selector shows
+        // Off/On. The On pick MUST be a level the provider's own request path
+        // accepts — pi-ai resolves only its fixed seven levels and rejects
+        // anything else per stream (`UNSUPPORTED_REASONING_EFFORT`). `high` is
+        // that level: because the model declares supportsReasoningEffort:
+        // false, pi-ai serializes a non-off effort as enable_thinking only —
+        // no reasoning_effort is sent, which is exactly the toggle semantics.
+        info.reasoning = {
+          ...reasoning,
+          efforts: [
+            { id: 'off', name: 'Off' },
+            { id: 'high', name: 'On' },
+          ],
+        }
+        return info
+      }
+      const efforts = [...(reasoning.efforts ?? [])]
+      if (!efforts.some(effort => effort.id === 'auto')) efforts.push(AUTO_EFFORT)
+      const override = overrideFor(provider, model)
+      if (
+        override?.efforts !== undefined
+        && override.efforts !== false
+        && override.efforts.includes('low')
+        && !efforts.some(effort => effort.id === 'low')
+      ) {
+        efforts.push(LOW_EFFORT)
+      }
+      info.reasoning = { ...reasoning, efforts }
+      return info
+    }
+  }
+}
+
+/** One resolved model's capability snapshot, cached per `provider/model`. */
+interface ModelCapability {
+  /** The model advertises at least one reasoning-effort level. */
+  supportsReasoning: boolean
+  /** The advertised effort ids, in selector order. */
+  efforts: readonly string[]
+  /** The model accepts image input (from `inputModalities`). */
+  vision: boolean
+  /**
+   * The model takes only an on/off thinking toggle (Qwen3.6-style, per the
+   * llm-pi-ai config): any effort level would be rejected, so the selector
+   * shows Off/On and `off` means "omit the effort" (enable_thinking false).
+   */
+  toggleOnly: boolean
+}
+
+/** Minimal face of the llm service's model-info query (typed locally). */
+interface LlmServiceLike {
+  resolveModelInfo: (provider: string, model: string, signal?: unknown) => Promise<{
+    reasoning?: { efforts?: { id: string }[] }
+    inputModalities?: string[]
+  }>
+}
+
+/** Minimal face of the settings service's write channel (typed locally). */
+interface SettingsWriteLike {
+  update?: (ns: string, patch: unknown) => Promise<unknown>
+}
+
+/**
+ * One `describe()` pass, two namespaces: the taken-over routes (transport
+ * section judgment) and the llm-pi-ai section for the posture lookup.
+ * `describe()` replaces the dead `settings?.get?.()` soft reads —
+ * `SettingsForms` has no `get`.
+ */
+function takeoverReadout(ctx: Context): { routes: string[] | null; piAi: PiAiSection | undefined } {
+  const descriptors = describeSettings(ctx)
+  // The transport's composition entry id changed shape across its packaging
+  // history — settle on whichever namespace the describe document carries.
+  const section = resolveNamespaceOf<{ enabled?: unknown; providers?: unknown }>(
+    descriptors,
+    TAKEOVER_NAMESPACE_CANDIDATES,
+  )?.value
+  const piAi = readSectionOf<PiAiSection>(descriptors, PI_AI_NAMESPACE)?.value
+  return { routes: takeoverRoutesOf(section), piAi }
+}
+
+/**
+ * The llm-pi-ai posture of one model, from the live llm-pi-ai section
+ * (the capability card writes `reasoningEfforts` and `compat` there). Absent
+ * when the route/model is not configured.
+ *
+ * A model is toggle-only (Off/On, no effort levels) only when ALL THREE hold:
+ * the model declares a thinking toggle (reasoningEfforts table, no
+ * supportsReasoningEffort), the route is taken over by the transport (it is in
+ * the takeover judgment), AND the route speaks the openai-completions wire
+ * protocol. The Off/On fold exists because a completions toggle model rejects
+ * any `reasoning_effort` string pi-ai does not resolve to its fixed seven
+ * levels; that physical reason does NOT apply to a Responses/Anthropic route,
+ * whose levels pi-ai maps natively (thinking budget / reasoning-effort enum)
+ * and whose `supportsReasoningEffort` compat field the host refuses to write
+ * at all (4.4.4). Folding such a route would silently strip the configured
+ * level set down to Off/On. A route OUTSIDE the takeover judgment is likewise
+ * served by pi-ai with its native reasoning semantics and is NOT folded here.
+ * (exported for the protocol-gate regression, issue #9 — same precedent as
+ * `advertiseModelCapability`)
+ */
+export function piAiPosture(
+  piAi: PiAiSection | undefined,
+  provider: string,
+  model: string,
+  takeover: string[] | null,
+): { thinkingOn: boolean; supportsEffort: boolean } | undefined {
+  const profile = piAi?.providers?.[provider]
+  const rows = Array.isArray(profile?.models)
+    ? profile!.models as Array<Record<string, unknown>>
+    : []
+  const entry = rows.find(candidate => candidate['id'] === model)
+  if (entry === undefined) return undefined
+  const efforts = entry['reasoningEfforts']
+  const compat = entry['compat']
+  const thinkingOn = typeof efforts === 'object' && efforts !== null && !Array.isArray(efforts)
+  const supportsEffort = typeof compat === 'object' && compat !== null
+    && (compat as Record<string, unknown>)['supportsReasoningEffort'] === true
+  // Toggle folding is a takeover-judgment concern AND an openai-completions
+  // concern: only a taken-over completions route gets the Off/On treatment.
+  // The transport is named `dsh-llm-openai-completions` but since the 4.4.x
+  // line fronts three protocols; a Responses/Anthropic route keeps its native
+  // effort levels (the table drives pi-ai's thinkingLevelMap). An absent `api`
+  // keeps pi-ai's openai-completions default, so it stays foldable — the same
+  // predicate as the card's `completionsCompatConfigurable`.
+  const api = profile?.api
+  const isCompletions = typeof api !== 'string' || api === 'openai-completions'
+  const toggled = takeover !== null && takeover.includes(provider)
+  return { thinkingOn: thinkingOn && toggled && isCompletions, supportsEffort }
+}
+
+const CAPABILITY_CACHE_KEY_SEPARATOR = '\u0000'
+
+/** A model that cannot be resolved is treated as non-reasoning: never inject. */
+const UNRESOLVABLE_CAPABILITY: ModelCapability = { supportsReasoning: false, efforts: [], vision: false, toggleOnly: false }
+
+/** Runtime model-capability lookup with a per-route cache. */
+function capabilityResolver(ctx: Context): {
+  resolve: (provider: unknown, model: unknown) => Promise<ModelCapability>
+  clear: () => void
+} {
+  const cache = new Map<string, ModelCapability>()
+  return {
+    async resolve(provider, model) {
+      if (typeof provider !== 'string' || typeof model !== 'string') return UNRESOLVABLE_CAPABILITY
+      const key = `${provider}${CAPABILITY_CACHE_KEY_SEPARATOR}${model}`
+      const cached = cache.get(key)
+      if (cached !== undefined) return cached
+      const llm = ctx.get('llm') as LlmServiceLike | undefined
+      let capability: ModelCapability
+      try {
+        const info = await llm?.resolveModelInfo?.(provider, model)
+        const efforts = info?.reasoning?.efforts?.map(effort => effort.id) ?? []
+        const readout = takeoverReadout(ctx)
+        const posture = piAiPosture(readout.piAi, provider, model, readout.routes)
+        capability = {
+          supportsReasoning: reasoningEffortSupported(info?.reasoning),
+          efforts,
+          vision: Array.isArray(info?.inputModalities) && info.inputModalities.includes('image'),
+          toggleOnly: posture?.thinkingOn === true && posture.supportsEffort === false,
+        }
+      } catch {
+        capability = UNRESOLVABLE_CAPABILITY
+      }
+      cache.set(key, capability)
+      return capability
+    },
+    clear() {
+      cache.clear()
+    },
+  }
+}
+
+interface LegacySettingsSctx {
+  settings: {
+    register?: (
+      ns: string,
+      schema: unknown,
+      options?: { base?: unknown },
+    ) => { get(): unknown; watch?(callback: () => void): () => void }
+    describe?: unknown
+  }
+  effect(cleanup: () => (() => void) | void, label?: string): void
+}
+
+/** The registered settings namespace of the ≤0.1.6 era. */
+const THINKING_LEVELS_SETTINGS_NAMESPACE = 'thinking-levels'
+
+/**
+ * The settings namespaces whose commits can move the takeover judgment
+ * (issue #4): the transport's `enabled` mirror must not be re-synced through
+ * a full describeSettings on EVERY unrelated commit — boot fires many.
+ * Includes both transport packaging ids and both own namespaces, so the
+ * mirror still re-checks whenever its own inputs move.
+ */
+const TAKEOVER_SYNC_NAMESPACES: readonly string[] = [
+  PI_AI_NAMESPACE,
+  ...TAKEOVER_NAMESPACE_CANDIDATES,
+  'dsh-thinking-levels',
+  THINKING_LEVELS_SETTINGS_NAMESPACE,
+]
+
+/**
+ * Legacy (≤0.1.6) settings registration: on hosts whose settings service
+ * carries the imperative face (`register` present, `describe` absent), install
+ * this plugin's section so its config is runtime-editable and the live values
+ * feed `current()`. On 0.1.7+ the composition entry IS the section (the
+ * `.volatile()` fields arrive as live refs) and `register` no longer exists —
+ * the install is a no-op there. Shape-detected, never version-guessed.
+ */
+export function installLegacySection(
+  ctx: Context,
+  config: ThinkingLevelsConfig,
+  hooks: { setSource: (source: () => ThinkingLevelsConfig) => void },
+): void {
+  const inject = (ctx as unknown as { inject?: (deps: string[], fn: (sctx: LegacySettingsSctx) => void) => void }).inject
+  if (typeof inject !== 'function') return
+  inject.call(ctx, ['settings'], (sctx) => {
+    const settings = sctx.settings as
+      | { register?: unknown; describe?: unknown; installSection?: unknown }
+      | undefined
+    console.log(`[dsh-thinking-levels] settings service face: register=${typeof settings?.register} installSection=${typeof settings?.installSection} describe=${typeof settings?.describe}`)
+    // `register`'s presence IS the imperative face (≤0.1.6). `describe` must
+    // NOT be read as a declarative-generation marker: the webServer mirror
+    // carries describe/mutate on EVERY generation (三代腰 finding —
+    // mutate/describe 四代全在), so the old `describe → skip` clause silently
+    // disabled this install on 0.1.2/0.1.5 too, leaving the namespace
+    // unregistered and every settingsScope.bind('thinking-levels') read
+    // `unavailable` forever.
+    if (typeof settings?.register !== 'function') return
+    try {
+      // The loader hands `apply` its config through the entry schema — the
+      // volatile-shaped `Config` on EVERY generation — so the runtime values
+      // sit behind live refs even on hosts taking the imperative register
+      // path. Flatten to plain values for the legacy resolver's base layer
+      // ("$.enabled expected boolean but got [object Object]", live on cell
+      // 0.1.5, was the ref riding in as the base).
+      const plainBase = {
+        enabled: readVolatile(config.enabled, true),
+        level: readVolatile(config.level, 'auto'),
+        allowDowngrade: readVolatile(config.allowDowngrade, true),
+        allowUpgrade: readVolatile(config.allowUpgrade, false),
+        takeover: readVolatile(config.takeover, false),
+        takeoverUi: readVolatile(config.takeoverUi, false),
+        models: config.models,
+      }
+      const scope = settings.register(THINKING_LEVELS_SETTINGS_NAMESPACE, LegacyConfig, { base: plainBase }) as {
+        get(): unknown
+        watch?(cb: () => void): void
+      }
+      console.log('[dsh-thinking-levels] settings via settings.register (≤0.1.6 imperative face)')
+      hooks.setSource(() => scope.get() as ThinkingLevelsConfig)
+      sctx.effect(() => () => {
+        hooks.setSource(() => config)
+      })
+      scope.watch?.(() => {})
+    } catch (error) {
+      console.log(`[dsh-thinking-levels] settings.register FAILED: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  })
+}
+
+/**
+ * Plugin body.
+ * @param ctx - host context carrying the agent-event dispatch.
+ * @param config - resolved plugin configuration.
+ */
+export function apply(ctx: Context, config: ThinkingLevelsConfig = DEFAULT_CONFIG): void {
+  // Fail-loud: a stray config value (e.g. `medium` from an old profile) must
+  // not ride through into the model request, where dsh throws
+  // UNSUPPORTED_REASONING_EFFORT per request.
+  assertEffortId(resolveLiveConfig(config).level, 'dsh-thinking-levels config.level')
+
+  // Runtime-adjustable configuration: volatile refs on 0.1.7+, the registered
+  // section before that — both re-read per request, so a committed settings
+  // change needs no re-registration. The ≤0.1.6 registered section (user edits
+  // layered over the entry base) wins when installed.
+  let source: () => ThinkingLevelsConfig = () => config
+  installLegacySection(ctx, config, { setSource: (next) => { source = next } })
+
+  // Cache-billing projection (0.1.7-alpha+ hosts): soft-coupled runtime inject
+  // ONLY — a top-level export inject would make the whole plugin refuse to
+  // load where the sessionProjections service is absent (<=0.1.6), killing the
+  // takeover on old lines for one optional surface. Where absent, the callback
+  // never fires and the ring's billing section stays hidden.
+  ;(ctx as unknown as {
+    inject?: (deps: string[], cb: (scope: {
+      sessionProjections?: { register: (definition: unknown) => void }
+    }) => void) => void
+  }).inject?.(['sessionProjections'], (scope) => {
+    // 注册失败只掉账单面（warn + 隐藏），不得毒化整个插件 fiber（takeover 主面）。
+    try {
+      const def = buildBillingDefinition(() => ({ defaultPricing: resolveLiveConfig(source()).defaultPricing })) as {
+      key: string
+      stateVersion: number
+      init: () => unknown
+      apply: (state: unknown, event: unknown) => unknown
+      stateSchema?: unknown
+      wire?: { viewSchema?: unknown; view?: unknown }
+      schema?: unknown
+      view?: unknown
+    }
+    // 0.1.0-rc.8 是唯一的旧平面契约 registry（snapshot 走 def.schema.parse(def.view(state))，
+    // 0.1.1+ 全线是 stateSchema/wire 新契约）。旧 registry 对缺 schema 的单元直接
+    // 「Cannot read properties of undefined (reading 'parse')」——一颗单元毒化全部
+    // 冷会话历史加载（2026-10-08 五格实证）。镜像 wire 形状为平面键，两代 registry
+    // 各取所需；新契约线多出的两个键无人消费，行为不变。
+    const wire = (def as { wire?: { viewSchema?: unknown; view?: unknown } }).wire
+    if (wire && def.schema === undefined) {
+      def.schema = wire.viewSchema
+      def.view = wire.view
+    }
+      scope.sessionProjections?.register(def)
+    } catch (error) {
+      console.warn(`[dsh-thinking-levels] tlCacheBilling register failed (billing section stays hidden): ${error instanceof Error ? error.message : String(error)}`)
+    }
+  })
+  const current: () => LiveConfig = () => resolveLiveConfig(source())
+  // Auto-schedule projection (issue #6): folds `tool/call` into the scheduler's
+  // sample ring and `model/selection` into the session's explicit pick. Same
+  // soft coupling and same "never poison the fiber" rule as the billing unit
+  // above — a registry that cannot serve `stateOf` is skipped outright rather
+  // than registered blind:
+  // - 0.1.0-rc.8 is the legacy plane-contract registry (`schema`/`view`, no
+  //   `stateOf`), and a unit missing `schema` there poisons every cold session
+  //   load.
+  // - where it is skipped, the scheduler falls back to the legacy
+  //   `session.events` read, which is exactly right for that one host line.
+  ;(ctx as unknown as {
+    inject?: (deps: string[], cb: (scope: { sessionProjections?: unknown }) => void) => void
+  }).inject?.(['sessionProjections'], (scope) => {
+    const registry = scope.sessionProjections as
+      | { register?: (definition: unknown) => void; stateOf?: unknown }
+      | undefined
+    if (typeof registry?.stateOf !== 'function' || typeof registry.register !== 'function') return
+    try {
+      registry.register(buildAutoScheduleDefinition())
+    } catch (error) {
+      console.warn(`[dsh-thinking-levels] tlAutoSchedule register failed (auto falls back to the legacy read): ${error instanceof Error ? error.message : String(error)}`)
+    }
+  })
+  ctx.on('loader/volatile-update', () => {
+    assertEffortId(resolveLiveConfig(config).level, 'dsh-thinking-levels config.level')
+    // A flipped takeover switch mirrors immediately (identity-gated).
+    syncTakeover()
+  })
+
+  // Official-compat bridge (check branch): write the OFFICIAL compat surface
+  // into the llm-pi-ai namespace for every provider that targets a custom
+  // openai-completions gateway AND declares thinking (reasoningEfforts table):
+  // route-level `supportsDeveloperRole: false` plus model-level
+  // `thinkingFormat: qwen` on toggle-style thinking rows. This replaces the
+  // retired short-circuit route (maintaining the dsh-llm-openai-completions
+  // takeover list): since dsh v0.1.0-rc.8 the declarative compat fixes the
+  // developer-role 400 AND drives enable_thinking at the pi-ai adapter itself,
+  // so pi-ai keeps serving the route and no transport takeover is needed.
+  // Storage pattern follows
+  // hytime/dsh-thinking-effort's host side: read → pure transform (identity
+  // when nothing to change) → whole-section update, so dsh's llm-pi-ai schema
+  // validator gates the write where it is WRITTEN; an installed dsh predating
+  // rc.8 rejects the unknown field and we log and keep the previous section.
+  // The read is lazy and writes are queued by the service, so no race with a
+  // concurrent Settings → Models edit.
+  let syncTail: Promise<unknown> = Promise.resolve()
+  const syncDeveloperRole = (): void => {
+    syncTail = syncTail.then(async () => {
+      const settings = ctx.get('settings') as SettingsWriteLike | undefined
+      // describe() is the only read channel on 0.1.7+ (SettingsForms has no
+      // `get`); the section value is the schema-projected live config.
+      const piAi = readSection<PiAiSection>(ctx, PI_AI_NAMESPACE)?.value
+      const next = withOfficialCompatFixes(piAi)
+      if (next === undefined || next === piAi) return
+      await settings?.update?.(PI_AI_NAMESPACE, { providers: next.providers })
+      ctx.logger?.info?.(
+        '[thinking-levels] official-compat: supportsDeveloperRole=false (route) and thinkingFormat=qwen (toggle-style models) written to llm-pi-ai for custom thinking routes',
+      )
+    }).catch((error) => {
+      ctx.logger?.warn?.('[thinking-levels] developer-role compat sync rejected (schema gate); kept previous section', error)
+    })
+  }
+
+  // Takeover mirror: this plugin's `takeover` switch (settings UI) is the
+  // control-layer master; the write lands in the transport's OWN section
+  // (`llm-openai-completions.enabled`), whose judgment stays single-source.
+  // Cross-plugin writes are schema-gated at the write site (the transport's
+  // `enabled` is volatile) and never touch its other fields. Writes fire only
+  // on divergence (transport absent = nothing to drive), so a manual edit of
+  // the transport section survives until the switch is actually flipped again.
+  const syncTakeover = (): void => {
+    syncTail = syncTail.then(async () => {
+      // Resolve the transport's LIVE namespace from the describe document
+      // (the entry id changed shape across its packaging history) — the read
+      // and the mirror write land on the same settled id.
+      const transport = resolveNamespaceOf<{ enabled?: unknown }>(
+        describeSettings(ctx),
+        TAKEOVER_NAMESPACE_CANDIDATES,
+      )
+      const patch = takeoverPatch(transport?.value, current().takeover)
+      if (patch === undefined || transport === undefined) return
+      const settings = ctx.get('settings') as SettingsWriteLike | undefined
+      await settings?.update?.(transport.ns, patch)
+      ctx.logger?.info?.('[thinking-levels] takeover switch %s written to %s.enabled', String(current().takeover), transport.ns)
+    }).catch((error) => {
+      ctx.logger?.warn?.('[thinking-levels] takeover mirror write rejected (schema gate); kept previous section', error)
+    })
+  }
+
+  // Initial sync (adapters may register later; re-run on every adapters update
+  // and every llm-pi-ai settings update so a Settings → Models edit propagates.
+  // The write is identity-gated, so the re-entry triggered by our own update
+  // settles immediately).
+  syncDeveloperRole()
+  syncTakeover()
+  const onSyncAny = ctx.on as unknown as (event: string, listener: (...args: never[]) => unknown) => void
+  onSyncAny('llm/adapters-updated', () => {
+    syncDeveloperRole()
+    syncTakeover()
+  })
+  onSyncAny('settings/document-updated', (ns: string) => {
+    if (ns === PI_AI_NAMESPACE) syncDeveloperRole()
+    // The mirror re-checks only where a commit can move the takeover
+    // judgment (issue #4); the write it just made re-enters here and
+    // settles (identity-gated) without a second write.
+    if (TAKEOVER_SYNC_NAMESPACES.includes(ns)) syncTakeover()
+  })
+
+  // Inject the level decision into every model request of a step.
+  // The 'agent/request' event key is augmented onto cordis Events by the
+  // dsh-agent runtime's generated scope types; the npm package does not
+  // re-export that augmentation, so the emitter is widened at the boundary.
+  //
+  // prepend: the host's model-selection assembly also listens on this event and
+  // overwrites `reasoningEffort` with the session's selection after `next()`;
+  // registering first keeps this plugin's decision OUTERMOST so it runs last.
+  const on = ctx.on as unknown as (
+    event: string,
+    handler: (payload: Record<string, unknown>, next: () => unknown) => unknown | Promise<unknown>,
+    options?: { prepend?: boolean },
+  ) => void
+
+  // Model capability snapshots, cached per provider/model and cleared whenever
+  // the adapter registry changes (a route's reasoning metadata can move).
+  const capability = capabilityResolver(ctx)
+
+  on('agent/request', async (payload, next) => {
+    const seed = await next() as { provider?: unknown; model?: unknown; reasoningEffort?: unknown }
+    const cfg = current()
+    // `enabled` may flip at runtime through the settings namespace.
+    if (!cfg.enabled) return seed
+
+    // Model-aware guard: never send a reasoning effort to a model that does
+    // not advertise one (custom openai-completions routes such as Qwen3.6).
+    // Unsupported fields are stripped, not sent; a resolved low/auto schedule
+    // only ever reaches models whose metadata admits the level.
+    const capabilityFor = await capability.resolve(seed.provider, seed.model)
+    // Folded projection state (issue #6): recent tool samples + the session's
+    // explicit pick. `undefined` on registries without `stateOf` (0.1.0-rc.8).
+    const session = (payload.agent as { session?: unknown } | undefined)?.session
+    const autoSchedule = readAutoSchedule(ctx, session)
+    const calls = autoSchedule?.samples ?? recentToolCalls(payload.agent)
+    // Intent comes from the session/config, never from the seed: the host
+    // echoes this plugin's own last injection back through the header.
+    const requested = requestedEffortOf(autoSchedule, cfg.level)
+    const decision = resolveEffortInjection({
+      supportsReasoning: capabilityFor.supportsReasoning,
+      requested,
+      seedEffort: seed.reasoningEffort,
+      recentCalls: calls,
+      allowDowngrade: cfg.allowDowngrade,
+      allowUpgrade: cfg.allowUpgrade,
+      efforts: capabilityFor.efforts,
+      toggleOnly: capabilityFor.toggleOnly,
+    })
+    if (!decision.inject) {
+      // The model cannot take any effort: drop an inherited one so dsh does
+      // not reject the request (UNSUPPORTED_REASONING_EFFORT).
+      const stripped = { ...seed }
+      delete (stripped as { reasoningEffort?: unknown }).reasoningEffort
+      ctx.logger?.info?.(
+        '[thinking-levels] agent/request: model=%s/%s has no reasoning effort; stripped',
+        String(seed.provider), String(seed.model),
+      )
+      return stripped
+    }
+    // Summary-only log: individual tool names/arg sizes are workflow metadata
+    // that need not land in the host log; count and decision suffice. `user=`
+    // and `src=` make the runtime proof for issue #6 readable: a healthy
+    // session shows `src=projection`, `calls>0` after tool activity, and
+    // `user=auto` on every request after the first.
+    ctx.logger?.info?.(
+      '[thinking-levels] agent/request: model=%s/%s user=%s seed=%s calls=%d => level=%s src=%s',
+      String(seed.provider), String(seed.model), String(requested),
+      String(seed.reasoningEffort), calls.length, decision.level,
+      autoSchedule === undefined ? 'legacy' : 'projection',
+    )
+    return { ...seed, reasoningEffort: decision.level }
+  }, { prepend: true })
+
+  // Advertise the `auto` mask (and, for configurer-confirmed rc.6-era models,
+  // `low`) in the model directory so the session model selector offers them
+  // alongside the adapter's native levels. Adapters may register after this
+  // plugin's apply (the load order differs between the CLI and DSH Desktop),
+  // so the wrapper also re-runs on every `llm/adapters-updated`.
+  const llm = ctx.get('llm') as { adapters?: Map<string, LlmRegistration> } | undefined
+  const overrideFor = (provider: string, model: string): ModelCapabilityOverride | undefined =>
+    current().models[`${provider}/${model}`]
+  // Read the live llm-pi-ai config for the thinking/effort posture the card
+  // wrote there: a model with `reasoningEfforts` but without effort support
+  // (Qwen3.6) is collapsed to an On/Off toggle in the selector — but ONLY when
+  // the route is taken over by the openai-completions transport. A pi-ai-served
+  // route (e.g. mimo via xiaomi) keeps its native off/high levels.
+  // Readout cache (issue #4): the resolveModel wrapper runs piAiFor on EVERY
+  // model resolution, and a full describeSettings per call made the model
+  // page cost O(models × adapters). One readout per generation, invalidated
+  // with the capability cache on every settings commit below.
+  let readoutCache: { routes: string[] | null; piAi: PiAiSection | undefined } | undefined
+  const cachedReadout = (): { routes: string[] | null; piAi: PiAiSection | undefined } => {
+    if (readoutCache === undefined) readoutCache = takeoverReadout(ctx)
+    return readoutCache
+  }
+  const piAiFor = (provider: string, model: string): { thinkingOn: boolean; supportsEffort: boolean } | undefined => {
+    const readout = cachedReadout()
+    return piAiPosture(readout.piAi, provider, model, readout.routes)
+  }
+  advertiseModelCapability(llm, overrideFor, piAiFor)
+  const onAny = ctx.on as unknown as (event: string, listener: (...args: never[]) => unknown) => void
+  onAny('llm/adapters-updated', () => {
+    capability.clear()
+    advertiseModelCapability(
+      ctx.get('llm') as { adapters?: Map<string, LlmRegistration> } | undefined,
+      overrideFor,
+      piAiFor,
+    )
+  })
+  // A settings commit can flip the takeover judgment (the transport's enabled
+  // flag or the llm-pi-ai routes): drop the cached capability snapshots so
+  // toggle folding follows the new posture on the next request.
+  onAny('settings/document-updated', () => {
+    capability.clear()
+    readoutCache = undefined
+  })
+}

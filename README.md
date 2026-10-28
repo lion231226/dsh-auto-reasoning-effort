@@ -1,0 +1,311 @@
+# dsh-thinking-levels
+
+**Per-round thinking-level (`reasoning_effort`) control for [DeepSeek Harness (dsh)](https://github.com/deepseek-ai/deepseek-harness): pick `Auto` (a mask) in the session model selector and the plugin schedules `low` / `high` / `max` from the recent tool-call history before submitting the API effort — or fix a wire level (`off` / `on` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max`) manually. Cheap tool rounds stay cheap; heavy work never starves.**
+
+- [English README](./README.md)
+> **v0.7.0-beta.1 (2026-09-06): the short-circuit route is retired.** This release no longer depends on `dsh-llm-openai-completions` — custom-gateway fixes ride the official `llm-pi-ai` compat surface (requires **dsh ≥ v0.1.2-alpha.1**); keep the adapter plugin uninstalled. See the [CHANGELOG](./CHANGELOG.md).
+
+- [中文 README](./README.zh.md)
+- [日本語 README](./README.ja.md)
+- [한국어 README](./README.ko.md)
+- [README en français](./README.fr.md)
+- [Deutsche README](./README.de.md)
+- [README in italiano](./README.it.md)
+- [README на русском](./README.ru.md)
+- [README en español](./README.es.md)
+- [Installation guide](./INSTALL.md)
+- [中文安装指南](./INSTALL.zh.md)
+- [日本語インストールガイド](./INSTALL.ja.md)
+- [한국어 설치 안내](./INSTALL.ko.md)
+- [Guide d'installation en français](./INSTALL.fr.md)
+- [Installationsanleitung auf Deutsch](./INSTALL.de.md)
+- [Guida all'installazione in italiano](./INSTALL.it.md)
+- [Руководство по установке на русском](./INSTALL.ru.md)
+- [Guía de instalación en español](./INSTALL.es.md)
+- [Changelog](./CHANGELOG.md)
+- [日本語 changelog](./CHANGELOG.ja.md)
+- [한국어 changelog](./CHANGELOG.ko.md)
+- [Changelog en français](./CHANGELOG.fr.md)
+- [Changelog auf Deutsch](./CHANGELOG.de.md)
+- [Changelog in italiano](./CHANGELOG.it.md)
+- [Список изменений на русском](./CHANGELOG.ru.md)
+- [Changelog en español](./CHANGELOG.es.md)
+
+> **▼ DSH version support**
+>
+> This release (4.3.x) pins DSH hosts by the exact 14-term enumeration `0.1.0-rc.8 || 0.1.1-rc.1 || 0.1.1-rc.2 || 0.1.2-rc.1 || 0.1.5-rc.1 || 0.1.5-rc.2 || 0.1.5-rc.3 || 0.1.7-rc.1 || 0.1.7-rc.2 || 0.2.0-rc.1 || 0.2.0-rc.2 || 0.2.1-rc.1 || 0.2.1-rc.2 || 0.2.1-rc.3` — each rc listed individually, no ranges or carets; 0.2.1 stable is not declared until it ships.
+>
+> | DSH version | Status | Notes |
+> | --- | --- | --- |
+> | ≥ 0.2.0-rc.1 | ✅ Supported | This release (4.0.x): same declarative settings surface (`.volatile()` schema fields rendered by the host; cross-plugin reads/writes through the `configForms` service), with the peer gate retargeted to the 0.2.0-rc segment |
+> | ≥ 0.1.7-rc.1 to < 0.2.0 | ✅ Supported | Use the 3.x line (3.4.3, npm dist-tag `dsh-0.1.7`): declarative settings — the host renders the Plugins form from the plugin's `.volatile()` schema fields; cross-plugin reads/writes go through the `configForms` service |
+> | < 0.1.7-rc.1 | ⚠️ Not supported | DSH 0.1.7 removed the imperative settings registration and the per-plugin card seat the earlier lines (3.0.x and below) relied on — stay on plugin 3.0.2 for 0.1.2–0.1.6 hosts. |
+>
+> The boundary is `0.1.7-rc.1`, where DSH removed the imperative settings registration (`settings.register` / `installSettingsSection`) and the client `settingsScope` service. Since that boundary the runtime-adjustable config fields are marked `.volatile()` in the schemastery schema, the host generates the settings form from that schema alone (no registration call, no client settings card), and the plugin reads the live values per request, driven by `loader/volatile-update`. The 3.1.x–3.4.x lines target the 0.1.7 declarative surface; the 4.0.x line is the same surface retargeted to the 0.2.0-rc segment.
+
+> **Version-range policy:** every compatibility line pins its host segment tightly. Lines targeting 0.1.x hosts follow `>=0.1.x-rc.1 <0.1.(x+1)-0` (3.1.x: `>=0.1.7-rc.1 <0.1.8-0`; 3.0.x: `>=0.1.5-alpha.1 <0.1.6-0`; 2.0.x: `>=0.1.2-alpha.1 <0.1.3-0`; 1.0.0-beta: `>=0.1.0-rc.8 <0.1.2-alpha.1`); lines targeting the 0.2.x segment follow `>=0.2.0-rc.1 <0.2.1-0` (4.0.x: `>=0.2.0-rc.1 <0.2.1-0`). No line ever declares an open upper bound, so a compatibility resolver can never match a plugin line against a newer host segment it was not built for. 0.4.0–0.6.0 carried no dsh peer declarations at all and are effectively compatibility-untyped — do not install them. Since the 4.2.x multi-line era, the 4.x line pins hosts with the exact per-rc enumeration above instead of a segment range — the range formulas describe the historical per-segment lines.
+
+> **Compatibility note:** Version `0.6.0` includes Japanese (`ja`) and Korean (`ko`) dictionaries and selector entries, but the current official DSH releases expose only `zh` and `en` through `LocaleRuntime`. On stock DSH, selecting `ja` or `ko` fails with `locale "<id>" is not registered`. These languages will work after official DSH adds the locale IDs. Advanced users can use a DSH fork that updates `packages/client/locale/src/locale-settings.ts` (`LOCALE_IDS`) and `packages/client/locale/src/client/index.ts` (`LOCALES` labels), together with the corresponding core dictionaries and tests, then rebuild and run the forked DSH. Changing this plugin alone cannot extend DSH's global locale list.
+
+In a multi-step tool chain, the model re-thinks before **every** tool call — and that thinking dominates the wall-clock time (a 50-step agent task can spend minutes reasoning between tools). `dsh-thinking-levels` plugs into the `agent/request` waterfall that dsh re-resolves for every step (registered with `prepend` so the session model-selection assembly cannot overwrite its decision) and injects a thinking level into the next model request.
+
+## Preview
+
+Screenshots of the live UI (dsh web):
+
+<figure>
+  <img width="460" alt="Model selector Auto dropdown injected by the plugin: levels Off / Low / High / Max / Auto, High currently selected, Auto highlighted — Auto is a mask, the plugin schedules low/high/max per step from the tool history." src="assets/官方模型的自动级别调整.png" />
+  <figcaption>Native model selector gains <strong>Auto</strong> — pick it and the plugin schedules low/high/max per step instead of a fixed wire level.</figcaption>
+</figure>
+
+<figure>
+  <img style="max-width:100%" alt="Thinking-level settings (3.0.x card shown): default level (auto scheduling), enable / allow-downgrade / allow-upgrade toggles, llm-pi-ai custom-provider model-capability table with the progressive per-model editor, and apply-to-all presets (Off/High/Max official DeepSeek style, Off/Low/Medium/High generic)." src="assets/自动思考级别配置.png" />
+  <figcaption>Thinking-level settings, 3.0.x card (screenshot kept for reference). Since 3.1.0 / DSH 0.1.7 the level, enable and scheduler toggles render as a host-generated declarative form; the custom card and its llm-pi-ai capability editor were removed with the retired seat.</figcaption>
+</figure>
+
+<figure>
+  <img style="max-width:100%" alt="Per-model capability editor for a custom openai-completions model (local-35b / Qwen3.6-35B-A3B), as shipped in the 3.0.x settings card: thinking model and vision enabled, support think effort off, thinking format qwen-chat-template (auto-filled); no takeover switch — the official compat flag lives on the provider row; context-window limit presets 64K/128K/256K/400K/512K/1M with a custom input." src="assets/自定义模型的思考接管-短路-上下文窗口限制.png" />
+  <figcaption>Per-model capability card, 3.0.x (screenshot kept for reference). Since 3.1.0 / DSH 0.1.7 the capability editor ships no more; edit `llm-pi-ai` model capabilities through the official Models settings instead.</figcaption>
+</figure>
+
+## Levels
+
+| Level | Meaning | Where |
+|---|---|---|
+| `off` | thinking disabled (manual only — never auto-picked) | model selector / default level |
+| `on` | thinking enabled (toggle-only models only): sends `enable_thinking`, never a think effort | model selector / default level |
+| `minimal` | least effort (very light tasks) | model selector / default level |
+| `low` | manual pick for simple chat tasks (cheap rounds stay cheap) | model selector / default level |
+| `medium` | medium effort | model selector / default level |
+| `high` | the official default effort | model selector / default level |
+| `xhigh` | extra high effort | model selector / default level |
+| `max` | heavy work | model selector / default level |
+| `auto` | **mask**: schedule per step from the recent tool-call history, resolved to a wire level before submission | model selector (injected by the plugin) / default level |
+
+Wire-level facts (verified against the official DeepSeek docs and dsh's `llm-deepseek` adapter): `low` maps 1:1 on deepseek-v4-flash / v4-pro, while `medium` / `xhigh` collapse onto `high`. The adapter accepts `off | low | high | max` and rejects anything else with `UNSUPPORTED_REASONING_EFFORT` — `auto` is the plugin's mask layer, never sent to the API, always resolved to a concrete wire level before injection. `on` is **not** an effort level: it is advertised only by toggle-only models (Qwen3.6-style), and it only flips `enable_thinking` true — no `reasoning_effort` is sent; an effort-capable model never advertises `on`, so a manual `on` pick on one is stripped.
+
+## Custom wire mapping
+
+For hand-declared `llm-pi-ai` models, map each level to the exact value your gateway expects (borrowed from dsh-thinking-effort): tick a level and enter its wire value, e.g. `high` → `ultra`. The mapping is stored as the model's `reasoningEfforts` table in the `llm-pi-ai` config, so the Composer selection `High` sends `ultra` to the gateway. Leaving `off` empty means "do not send".
+
+- Official preset: `Off / High / Max` (official DeepSeek style)
+- Generic preset: `Off / Low / Medium / High`
+
+> The visual editor for this mapping rode the plugin's settings card, which the DSH 0.1.7 migration removed (the seat no longer exists). Edit the `reasoningEfforts` table through the official Models settings surface instead — the host-side detection and injection read it live either way.
+
+## Effort slider (per model line)
+
+The model panel's per-line effort `<select>` became a **segment slider**: click a line's effort chip (it shows the effective level, or *Provider default*) and a full-width slider expands under that line. The stop count adapts to what the model advertises — two-stop toggle-only models, the official `off/low/high/max` set, custom gateway wire values; `auto` (when the directory carries the mask) is pinned **leftmost**, then `off`/`on`, then the strength gradient, unknown wire values last.
+
+Since 4.4.0 the selector's own effort chip shows the **user intent**, not the scheduler's resolved level: with the intent `auto` the main label stays **Auto** and the level actually sent in the last step is demoted to a secondary hint (`→ low`). Note: while the model-UI takeover below is off, the *official* selector's chip keeps showing the last resolved level — that is host projection semantics the plugin cannot restyle.
+
+Interaction follows the approved dsh-reasoning-effort visual baseline: the thumb follows the pointer continuously and **snaps on release** (one route write per gesture), the plain thumb is pure white in every theme, the thumb stays fully visible at both endpoints, and ←/→/Home/End step stop-by-stop. The select's *Provider default* reset survives as the ↺ button of the slider row.
+
+DeepSeek lines (the official route, or any gateway model whose id/name says deepseek) run the **whale-girl runner** as the thumb: an 8-frame side-run strip, ping-pong looped (720 ms per direction at rest, 420 ms while dragging), frozen under `prefers-reduced-motion`. Every other model gets the plain knob.
+
+## Model UI takeover (since 4.4.0)
+
+New setting `takeoverUi` (default **off**): the plugin no longer replaces the composer's model popup — search, grouping and loading stay with the shipped selector, and the `auto` mask still arrives through the server-side advertisement; official-model context editing lives on the settings card. Turning it on restores the ModelPanel takeover (per-line editors + popup search). Changes apply immediately — no reload needed.
+
+The strip is community whale-girl artwork sourced from [HanaAyane/dsh-reasoning-effort](https://github.com/HanaAyane/dsh-reasoning-effort) (`assets/chibi-runner-strip.png`); regenerate the inlined asset with `python tools/whale-mascot.py`.
+
+## Context-window presets
+
+The composer tool-row quick control (next to the model/effort select) edits a **context window limit**: preset stops `64K / 128K / 256K / 400K / 512K / 1M`, a custom integer input, and a clear button. The value is written to the `llm-pi-ai` model entry `contextWindow` (integer `2000`–`1000000`) — or to the `llm-deepseek` entry for official DeepSeek models.
+
+Upstream, the harness consumes it through `resolveModelInfo(...).context.contextWindow` for compaction thresholds, context-overflow detection and context-pressure projections. Because `llm-pi-ai` re-reads the live config on every resolve and the compat sync does not block model discovery, a settings edit takes effect on the next request without a restart.
+
+The plugin config also accepts `models['provider/model'].contextWindow` as a validated (integer `2000`–`1000000`) declaration at the composition/config surface.
+
+## Model-aware guard (v0.5.0)
+
+The plugin never sends a `reasoning_effort` to a model that does not advertise one. Custom
+openai-completions routes (e.g. a local Qwen3.6 without `reasoningEfforts`) are classified
+non-reasoning via `ctx.llm.resolveModelInfo`, and any effort — inherited or scheduled — is
+**stripped** instead of sent, so dsh's per-request `UNSUPPORTED_REASONING_EFFORT` rejection
+cannot fire. Unsupported fields are never passed to an API that cannot take them.
+
+Version behavior:
+
+| dsh version | `low` handling |
+|---|---|
+| rc.6 (old) | not native: the selector only shows it when a configurer-confirmed `models` override names it; the level is then advertised (selector + request validation) and passed through verbatim |
+| rc.7+ (new) | native: the plugin neither rewrites nor re-injects it; a manual `low` pick passes through unchanged |
+
+The auto scheduler may still pick `low` for supporting models — the capability guard above is
+what keeps it away from models that cannot take it.
+
+## Model-selector Auto
+
+The session model selector (next to the model) now offers **Auto** after the wire levels (injected into the model-directory metadata by the plugin):
+
+| Model-selector pick | Behavior |
+|---|---|
+| **Auto** | plugin schedules via tool history + the upgrade/downgrade toggles, resolves to `low` / `high` / `max` before submission |
+| `off` / `on` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max` | **manual choice wins** — plugin does not intervene (`on` stays `on` on toggle-only models, never lifted to an effort; effort-capable models strip it) |
+| unset | the plugin's default level applies (below) |
+
+## Auto scheduler
+
+The hub is `high` (the official default). `auto` schedules between `low` / `high` / `max`; it never picks `off`.
+
+| Recent tool calls | Level |
+|---|---|
+| none (fresh prompt, pure chat) | `low` |
+| ≥75% simple tools, small args, downgrades allowed | `low` |
+| mixed / heavy tools | `high` |
+| very heavy payloads, upgrades allowed | `max` |
+
+The scheduling policy is the same source as [dsh-tool-turbo](https://github.com/drscrewdriver/dsh-tool-turbo) (same simple-tool whitelist / payload thresholds / 75% ratio rule).
+
+**Where the samples come from (4.4.7+).** The scheduler folds `tool/call` events into a Session projection (`tlAutoSchedule`), so it sees real tool history on every host from 0.1.2-rc.1 on; the pre-4.4.7 `session.events` read only ever produced samples on 0.1.0-rc.8. The session's explicit pick is folded from `model/selection` events, so a level the host echoes back can never be mistaken for a manual choice. Known limitation: host `0.1.0-rc.8` exposes no `stateOf` on its projection registry (legacy plane contract), so that one line keeps the old array read — scheduling works there, the echo correction does not.
+
+## Install
+
+See [INSTALL.md](./INSTALL.md) for the full official-CLI guide (profile discovery, upgrade, migration, verification, troubleshooting). Quick start:
+
+```bash
+# 1. install the plugin into a profile from npm (web shown; any profile works)
+#    (the web profile is a pnpm workspace root, so -w is required)
+dsh plugin --profile web add dsh-thinking-levels -w
+#    GitHub alternative:
+#    dsh plugin --profile web add https://github.com/drscrewdriver/dsh-thinking-levels.git -w
+#    local-path alternative (no network needed):
+#    dsh plugin --profile web add /absolute/path/to/dsh-thinking-levels
+
+# 2. restart dsh web (a running instance does not hot-load new bundle layers)
+dsh web
+```
+
+> Note: the dsh runtime uses pnpm 11, whose `minimumReleaseAge` supply-chain policy may block a
+> freshly published version with `ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION` — add the version to
+> `minimumReleaseAgeExclude` in `~/.dsh/profiles/web/pnpm-workspace.yaml` to lift the cooling period.
+
+Manual `link:` registration (alternative to `dsh plugin add`):
+
+```bash
+#    ~/.dsh/profiles/web/package.json dependencies:
+#      "dsh-thinking-levels": "link:<absolute path to dsh-thinking-levels>"
+#    ~/.dsh/profiles/web/cordis.patch.yml:
+#      - insert:
+#          - id: thinking-levels
+#            name: dsh-thinking-levels
+cd ~/.dsh/profiles/web && pnpm install && dsh web
+```
+
+## Configuration
+
+Two surfaces share one schema:
+
+- **Assembly** — the plugin row's `config:` in the profile composition (e.g. `cordis.yml`):
+  ```yaml
+  config:
+    level: auto            # off | on | minimal | low | medium | high | xhigh | max | auto — the default level when the session picks nothing
+    allowDowngrade: true   # let the scheduler drop below `high`
+    allowUpgrade: false    # forbid the scheduler lifting to `max`
+  ```
+- **Runtime** — the plugin's `.volatile()` config fields (`enabled`, `level`, `allowDowngrade`, `allowUpgrade`): DSH 0.1.7 renders the Plugins settings form from the declared schema, and committed changes reach the plugin as live config references (`loader/volatile-update`) — they apply to the next model request, no restart needed. (`models` stays a configurer-level field: edit it in the profile composition.)
+
+Per-model capability overrides (`models`, keyed `provider/model`) confirm what auto-detection
+finds; the configurer has the final word:
+
+```yaml
+config:
+  level: auto
+  models:
+    llm-pi-ai/Qwen3.6-35B-A3B:   # non-reasoning thinking model (thinking toggle + budget)
+      vision: false
+      thinking: true
+      efforts: false             # never send reasoning_effort (stripped at request time)
+    llm-pi-ai/Qwen3.8-27B:       # effort-capable model (rc.6-era adapter without low)
+      efforts: [low, high]       # confirm low → advertised in the selector + passed through
+```
+
+> For Qwen thinking on/off + budget, configure the **llm-pi-ai** route instead:
+> `compat.thinkingFormat: qwen` (→ wire `enable_thinking` + `thinking_budget` via
+> `thinkingBudgets`), or `qwen-chat-template` (→ `chat_template_kwargs.enable_thinking`) for
+> effort models like Qwen3.8-27B.
+
+Defaults: `{ enabled: true, level: 'auto', allowDowngrade: true, allowUpgrade: false, models: {} }`.
+
+> Semantics: the model-selector pick outranks the plugin's default level. Pick `auto` (mask) → plugin schedules; pick a wire level → applied directly; pick nothing → the plugin's `level` default is used. `allowDowngrade` / `allowUpgrade` constrain `auto` scheduling only.
+
+## Third-party transport takeover (three protocols)
+
+The settings card's **Third-party takeover** switch (「第三方接管」) adds a route to the
+`dsh-llm-openai-completions` transport's `providers` list. **The transport's name is
+legacy** — since the 4.4.x line it fronts three wire protocols, not just
+`openai-completions`: `openai-completions`, `openai-responses` and `anthropic`. When a
+route is taken over, its model requests are short-circuited through that transport
+(multimodal true-send, modality gate, prompt injection) and `llm-pi-ai` steps out.
+
+The per-level wire editor (`reasoningEfforts`) is **protocol-neutral** since 4.4.4: the
+host turns the table into pi-ai's `thinkingLevelMap`, which every protocol reads
+(Anthropic thinking budget, Responses reasoning effort, completions `reasoning_effort`
+string). The two completions-only compat switches (`支持 think effort` / `思考格式`)
+render *only* on `openai-completions` routes — elsewhere the host rejects them at write
+time, so they are absent from the DOM.
+
+> **Toggle-folding caveat (fixed in 4.4.5).** The Off/On collapse of a thinking model's selector is an
+> `openai-completions`-only behavior: it fires when a route is taken over **and** the
+> model carries a `reasoningEfforts` table **without** `compat.supportsReasoningEffort: true`.
+> That fold exists because pi-ai rejects a `reasoning_effort` string outside its fixed seven
+> levels — a completions-wire concern. On a Responses/Anthropic route the levels map natively
+> (thinking budget / reasoning-effort enum) and `supportsReasoningEffort` cannot be written at
+> all, so through 4.4.4 taking such a route over wrongly folded a multi-level table to Off/On.
+> Since 4.4.5 the fold additionally requires the route's `api` to be `openai-completions` (or
+> absent), so a taken-over Responses/Anthropic route keeps its full level set end to end.
+
+## Official compat surface: the short-circuit tool is retired (0.7.0-beta.1)
+
+Once custom gateways (vLLM / LM Studio / self-hosted OpenAI-compatible proxies) declare
+thinking, this plugin writes the fixes into the **official `llm-pi-ai` compat surface**
+(introduced in dsh ≥ **v0.1.0-rc.8**, commit `884f7b9c41`) —
+[dsh-llm-openai-completions](https://github.com/drscrewdriver/dsh-llm-openai-completions)
+is no longer needed for the developer-role fix and should stay uninstalled unless you
+explicitly want its three-protocol takeover (see above):
+
+- Scans `llm-pi-ai.providers` for routes that are custom gateways **and** declare a
+  `reasoningEfforts` table on any model (including `modelOverrides`), then writes:
+  - route-level `compat.supportsDeveloperRole: false` — the system prompt goes out as
+    `system`, fixing the vLLM / SGLang `Unexpected message role` 400;
+  - model-level `compat.thinkingFormat: 'qwen-chat-template'` on toggle-style thinking rows
+    (thinking table without row-level `supportsReasoningEffort`) — pi-ai then sends
+    `chat_template_kwargs.enable_thinking` (bare vLLM servers ignore the top-level
+    `enable_thinking` of the plain `qwen` format);
+- Writes go through the official settings channel (read → pure transform → whole-section
+  `settings.update('llm-pi-ai', …)`), so dsh's schema validates the write **where it is
+  written**: a dsh older than rc.8 rejects the fields with a log warning — no silent
+  misconfiguration; explicit values on any layer are never clobbered;
+- Triggers on plugin start, `llm/adapters-updated`, and `llm-pi-ai` config changes — no
+  manual config editing;
+- Response-side inline `<think>` splitting remains a **gateway concern**: bare vLLM needs
+  `--reasoning-parser qwen3` (pi-ai parses only `reasoning_content` / `reasoning` /
+  `reasoning_text`).
+
+# Dependency note
+
+The host half does **not** value-depend on `@deepseek-ai/dsh-settings` — since the DSH 0.1.7 line there is no settings registration at all: the settings form is generated by the host from the plugin's declared schemastery schema (`.volatile()` fields), and the client half talks to the `configForms` service provided by the dsh runtime. No need to install official packages into the profile manually. `dependencies` is just `@deepseek-ai/schemastery` (installed automatically with the package).
+
+## Development
+
+```bash
+npm run lint        # eslint (typescript-eslint flat config)
+npm run typecheck   # tsc --noEmit
+npm test            # vitest — 46 tests
+```
+
+Test coverage: level policy (manual pass-through incl. the extended levels, `on` clamping, auto scheduler, validation, simple-tool boundary), the model-capability guard (`reasoningEffortSupported`, `resolveEffortInjection` stripping/passthrough), session-event parsing (guards, window cap, malformed records), the config schema (defaults lockstep, out-of-band rejection, `models` overrides), and the official-compat sync (identification, explicit-value respect, identity idempotence, write-time schema gating).
+
+
+## Pricing catalog (4.3.0+)
+
+Billing samples are priced at fold time from a builtin catalog (src/price-catalog.ts): 29 model entries x region. DeepSeek V4.1-Flash / V4-Flash / V4-Pro carry the official peak/off-peak pairs (Beijing 09:00-12:00 and 14:00-18:00 on workdays are peak; the 2026 State Council holiday/make-up table is applied, with make-up-workday weekends counted as workdays); GLM / Kimi / Qwen / Doubao / MiniMax / Ernie carry flat CN rates. Each entry prices three slots per million tokens — non-cached input, cache-hit input and output — with asOf + source annotations; currency follows the entry (¥ CNY, $ USD, no FX conversion). Overseas (USD) catalog slots are intentionally empty until official pages can be re-verified.
+
+Models outside the catalog fall to the defaultPricing setting (cn / global / custom / off, default off): "off" renders the billing popover as unpriced while token counters keep working — nothing is silently estimated any more.
+
+Semantics note: a pricing or policy change only affects samples booked after the change; the first time you open an old session right after upgrading, its cumulative ledger is refolded once against the current catalog.
+
+## License
+
+MIT

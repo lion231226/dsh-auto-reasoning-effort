@@ -1,0 +1,199 @@
+/**
+ * Local contract declarations for the @deepseek-ai/* platform surfaces the
+ * plugin consumes. The npm publication chain for the harness client packages
+ * is incomplete (rc placeholders miss several transitive packages), and the
+ * plugin never value-imports them anyway — the browser half talks to cordis
+ * services and slot registration only, and the loader module table supplies
+ * the real modules at runtime.
+ *
+ * These declarations mirror the harness sources at the anchors below for the
+ * supported release segment `>=0.1.2-alpha.1 <0.2.0-0` — the segment that
+ * removed `@deepseek-ai/dsh-client-runtime`. Members are declared only where
+ * this plugin reads them, so drift against a future harness release shows up
+ * as a slot-registration or type error at build time instead of in a browser.
+ *
+ * Mirror anchors (verified 2026-09-11 against dsh-v0.1.5-rc.2; the
+ * `configForms` face mirrors the DSH 0.1.7 settings contract):
+ * - `packages/client/ui-renderer/src/client/registry.ts:95` — `SlotRegistry`,
+ *   the `slots` service behind this mirror's `SlotsFace`.
+ * - `packages/client/ui-settings/src/client/settings-contract.ts` — `ConfigForm`.
+ * - `packages/client/locale/src/client/index.ts:380` — the `register` overloads.
+ */
+
+/**
+ * The harness's shared model-directory faces (owned by the
+ * `dsh-client-ui-model-selection` module). Declared as global ambient types:
+ * the service reaches the plugin through the client context's `modelDirectories`
+ * member (present when the module is listed in the plugin's client inject
+ * table), and harness lines without the module simply leave it undefined —
+ * the model-panel registration is then skipped.
+ */
+interface ModelSnapshotStore<T> {
+  subscribe(listener: () => void): () => void
+  getSnapshot(): T
+}
+
+/** One model catalog entry as the directory state carries it. */
+interface ModelDirectoryModel {
+  id: string
+  name: string
+  description?: string
+  reasoning?: {
+    efforts: { id: string; name: string; description?: string }[]
+    defaultEffort?: string
+  }
+}
+
+/** One provider group of the model catalog. */
+interface ModelDirectoryGroup {
+  id: string
+  name?: string
+  label?: string
+  models: ModelDirectoryModel[]
+}
+
+/** The shared model directory state snapshot. */
+interface ModelDirectoryState {
+  status: 'loading' | 'ready'
+  groups: ModelDirectoryGroup[]
+  current: { provider: string; model: string; reasoningEffort?: string } | null
+  error: string | null
+}
+
+/** One session's model directory: shared store + load + route select. */
+interface ModelDirectoryFace {
+  store: ModelSnapshotStore<ModelDirectoryState>
+  load(): Promise<void>
+  select(selection: { provider: string; model: string; reasoningEffort?: string }): Promise<void>
+}
+
+/** The `modelDirectories` service face, keyed by session id. */
+interface ModelDirectoriesFace {
+  directoryFor(sessionId: string): ModelDirectoryFace
+}
+
+/**
+ * The narrow `sessions` face `directoryFor` needs. Declared because the
+ * resolver resolves `this.ctx.sessions` against the ACCESSING context (cordis
+ * traceable services rebind `ctx` to the reader): any fiber that calls
+ * `directoryFor` must declare these services itself or the call throws.
+ */
+interface SessionsFace {
+  scope(sessionId: string): unknown
+  binding(sessionId: string): unknown
+}
+
+declare module '@deepseek-ai/dsh-client-ui-slots' {
+  /** Slot map entries consumed by this plugin (subset of the harness table). */
+  export interface SlotMap {
+    /**
+     * The composer's model seat: the shipped `ModelSelect` owns this seat by
+     * default, and a registered entry named after the seat (`priority: -1`,
+     * the dsh-reasoning-effort pattern) replaces the trigger and its popup
+     * outright — the official popup renders no slots, so this override is the
+     * only way to contribute the per-line context-window editor. Session-
+     * scoped single seat carrying the session standard seats (`sessionId`).
+     */
+    'conversation.input.model': { kind: 'single'; scope: 'session' }
+    /**
+     * The composer tool row's right seat (next to the model/effort control,
+     * before the send button): a session-scoped list seat with no owner props,
+     * one-row height budget. (Held for other tool-row controls; the retired
+     * context-window pill no longer registers here — its editor moved into
+     * the model panel's per-model lines.)
+     */
+    'conversation.input.right': { kind: 'list'; scope: 'session' }
+    /**
+     * The ≤0.1.6 per-plugin settings card seat (removed in the 0.1.7
+     * declarative migration). Declared so the merged client can register its
+     * legacy card on the old lines; on 0.1.7+ the seat does not exist and the
+     * registration path never runs (the legacy card rides the settingsScope
+     * waist, which only fires where the host provides it).
+     */
+    'settings.plugin.item': { kind: 'keyed'; scope: 'root' }
+  }
+
+  /** Locale namespaces merged by client plugins. */
+  export interface LocaleNamespaceMap {
+    'thinking-levels': string
+  }
+
+  /** Translate thunk bound to one dictionary namespace. */
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars -- the type parameter constrains the namespace key
+  export type TranslateNS<_N extends keyof LocaleNamespaceMap & string> =
+    (key: string, params?: Record<string, unknown>) => string
+
+  /** Locale seat delivered to slot components. */
+  export type PropsLocale<N extends keyof LocaleNamespaceMap & string> = { t: TranslateNS<N> }
+
+  /** One registration's options (keyed-list shape used by this plugin). */
+  export interface SlotRegisterOptions<K extends keyof SlotMap & string> {
+    name: K
+    id?: string
+    key?: string
+    order?: number
+    priority?: number
+    /** Registrant label (string or locale thunk) shown by host diagnostics. */
+    label?: string | (() => string)
+    locale?: string
+    inject?: (...args: never[]) => unknown
+  }
+
+  /** The slot registry face available on the client context. */
+  export interface SlotsFace {
+    /** Wait for the slot declaration, register, and roll back with the caller fiber. */
+    inject(name: keyof SlotMap & string, fn: () => unknown): () => void
+    register<K extends keyof SlotMap & string>(options: SlotRegisterOptions<K>, component: unknown): () => void
+  }
+}
+
+declare module '@deepseek-ai/dsh-client-locale/client' {
+  /** Dictionary registration face. Returns the disposer that drops the dictionaries. */
+  export interface LocaleFace {
+    register(namespace: string, dictionaries: Record<string, Record<string, string>>): () => void
+    /**
+     * Bind a namespace to a translate function that re-reads the active locale
+     * per call (stable reference per namespace).
+     */
+    bind(namespace: string): (key: string, params?: Record<string, unknown>) => string
+  }
+}
+
+declare module '@deepseek-ai/dsh-client-ui-settings/client' {
+  /** Snapshot of one plugin's config form, as the client reads it. */
+  export interface ConfigFormSnapshot<T> {
+    status: 'loading' | 'ready' | 'unavailable'
+    value: T | undefined
+    /** Composition base layer and raw user layer, exposed for override display. */
+    base: unknown
+    user: unknown
+    /** Write fence: the revision this snapshot was folded at. */
+    revision: number | undefined
+    writable: boolean
+    mode: 'host' | 'memory'
+  }
+
+  /**
+   * One plugin's config form (DSH 0.1.7 `configForms` service), keyed by the
+   * plugin's composition entry id. Replaces the retired per-namespace
+   * binding service: same accessor names, `update` renamed to `mutate`, plus
+   * an explicit `dispose`.
+   */
+  export interface ConfigForm<T> {
+    getSnapshot(): ConfigFormSnapshot<T>
+    subscribe(listener: () => void): () => void
+    set(field: string, value: unknown): Promise<void>
+    unset(field: string): Promise<void>
+    /** Merge a partial patch into the form's user layer (the retired `update`). */
+    mutate(patch: Partial<T>): Promise<void>
+    /** Release the form binding; the holder must call it when done. */
+    dispose(): void
+  }
+
+  /** The `configForms` service face available on the client context. */
+  export interface ConfigFormsFace {
+    get<T>(entryId: string): ConfigForm<T>
+  }
+}
+
+

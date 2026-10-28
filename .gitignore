@@ -1,0 +1,4 @@
+node_modules/
+dist/
+_wt-audit/
+*.tgz

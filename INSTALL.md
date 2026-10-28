@@ -1,0 +1,191 @@
+# Installation Guide (Official DSH CLI)
+
+This guide uses only the official DSH `dsh plugin` command. The command installs the dependency into a profile and synchronizes `dsh.profile.bundles`. Do not replace it with plain `npm install`, direct `pnpm add` in the profile, or manual edits to the profile manifest.
+
+- [English installation guide](./INSTALL.md)
+- [中文安装指南](./INSTALL.zh.md)
+- [日本語インストールガイド](./INSTALL.ja.md)
+- [한국어 설치 안내](./INSTALL.ko.md)
+- [Guide d'installation en français](./INSTALL.fr.md)
+- [Installationsanleitung auf Deutsch](./INSTALL.de.md)
+- [Guida all'installazione in italiano](./INSTALL.it.md)
+- [Руководство по установке на русском](./INSTALL.ru.md)
+- [Guía de instalación en español](./INSTALL.es.md)
+- [English README](./README.md)
+- [中文 README](./README.zh.md)
+- [日本語 README](./README.ja.md)
+- [한국어 README](./README.ko.md)
+- [README en français](./README.fr.md)
+- [Deutsche README](./README.de.md)
+- [README in italiano](./README.it.md)
+- [README на русском](./README.ru.md)
+- [README en español](./README.es.md)
+- [Changelog](./CHANGELOG.md)
+- [日本語 changelog](./CHANGELOG.ja.md)
+- [한국어 changelog](./CHANGELOG.ko.md)
+- [Changelog en français](./CHANGELOG.fr.md)
+- [Changelog auf Deutsch](./CHANGELOG.de.md)
+- [Changelog in italiano](./CHANGELOG.it.md)
+- [Список изменений на русском](./CHANGELOG.ru.md)
+- [Changelog en español](./CHANGELOG.es.md)
+
+The placeholders in this guide are:
+
+- `<profile>`: the DSH profile to modify, usually `web`;
+- `dsh-thinking-levels`: the npm package and runtime plugin ID;
+- `thinking-levels`: the Cordis composition and settings Slot ID.
+
+> **Version requirement — DSH v0.2.0-rc.1 or newer.**
+>
+> Check the running version first (`dsh --version`).
+>
+> | DSH version | Action |
+> | --- | --- |
+> | ≥ 0.2.0-rc.1 | Install this release (4.0.x). |
+> | ≥ 0.1.7-rc.1 to < 0.2.0 | Install the 3.x line: `dsh plugin --profile <profile> add dsh-thinking-levels@dsh-0.1.7 -w` (3.4.3). |
+> | < 0.1.7-rc.1 | Stay on the previous plugin line (3.0.2). Do not run an older plugin build against DSH 0.1.7+ — upgrade the plugin instead. |
+>
+> The boundary is `0.1.7-rc.1`, where DSH removed the imperative settings registration (`settings.register` / `installSettingsSection`) and the client `settingsScope` service. Since that boundary both the 3.x line (0.1.7 hosts) and this release (0.2.0-rc hosts) target the same declarative settings surface (`.volatile()` schema fields + `configForms`).
+
+> Older DSH lines install from npm via their dist-tag: `dsh plugin add dsh-thinking-levels@dsh-0.1.7` (DSH 0.1.7–0.1.x, plugin 3.4.3), `...@dsh-0.1.5` (DSH 0.1.5), `...@dsh-0.1.2` (DSH 0.1.2), `...@compat` (DSH 0.1.0–0.1.1). Never install the bare `latest`-era `0.x` versions (≤ 0.6.0) — they carry no dsh peer declarations.
+
+## 0. Prerequisites and profile discovery
+
+```bash
+echo "DSH_HOME=${DSH_HOME:-$HOME/.dsh}"
+dsh --version
+ls "${DSH_HOME:-$HOME/.dsh}/profiles"
+```
+
+Use the profile named by your running DSH process. `web` is common, but the active `--profile` argument is authoritative.
+
+## 1. Official installation
+
+Install the latest version:
+
+```bash
+dsh plugin --profile <profile> add dsh-thinking-levels -w
+```
+
+(The `-w` flag is required when the profile is a pnpm workspace root, as `web` is.)
+
+Install the current release explicitly:
+
+```bash
+dsh plugin --profile <profile> add dsh-thinking-levels@4.0.0 -w
+```
+
+The official CLI updates the profile dependency, lockfile, and `dsh.profile.bundles` automatically. Do not add a manual YAML row.
+
+### Supply-chain cooling period
+
+The dsh runtime uses pnpm 11, whose `minimumReleaseAge` policy may block a freshly published
+version with `ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION`. Add the version to
+`minimumReleaseAgeExclude` in `~/.dsh/profiles/web/pnpm-workspace.yaml`:
+
+```yaml
+minimumReleaseAgeExclude:
+  - dsh-thinking-levels@4.0.0
+```
+
+## 2. Upgrade
+
+Upgrade to the latest registry version:
+
+```bash
+dsh plugin --profile <profile> update dsh-thinking-levels -w
+```
+
+Restart DSH for host changes and refresh the Web page for client changes.
+
+## 3. Local-path / link: registration (alternative)
+
+For development or offline installs, register the plugin from a local checkout:
+
+```bash
+#    ~/.dsh/profiles/web/package.json dependencies:
+#      "dsh-thinking-levels": "link:<absolute path to dsh-thinking-levels>"
+#    ~/.dsh/profiles/web/cordis.patch.yml:
+#      - insert:
+#          - id: thinking-levels
+#            name: dsh-thinking-levels
+cd ~/.dsh/profiles/web && pnpm install && dsh web
+```
+
+Or use the official CLI with a local path (no network needed):
+
+```bash
+dsh plugin --profile <profile> add /absolute/path/to/dsh-thinking-levels -w
+```
+
+## 4. Verify installation
+
+Check the dependency and installed version:
+
+```bash
+grep -n "dsh-thinking-levels" \
+  "${DSH_HOME:-$HOME/.dsh}/profiles/<profile>/package.json"
+node -p "require('${DSH_HOME:-$HOME/.dsh}/profiles/<profile>/node_modules/dsh-thinking-levels/package.json').version"
+```
+
+The version must be `4.0.0` for this release.
+
+Check the official composition:
+
+```bash
+dsh --profile <profile> --dump-default-config
+```
+
+It must contain:
+
+```yaml
+- id: thinking-levels
+  name: dsh-thinking-levels
+```
+
+## 5. Verify the settings form
+
+Restart DSH, then refresh the Web page. Open **Settings → Plugins** and find the **dsh-thinking-levels** entry — since DSH 0.1.7 the form is generated by the host from the plugin's declared `.volatile()` schema fields (there is no custom client card any more).
+
+1. The form shows the enable toggle, the level picker (eight standard levels plus `auto`) and the scheduler toggles (`allowDowngrade` / `allowUpgrade`).
+2. Committed changes apply to the next model request without a restart (live volatile config).
+3. The per-model capability editor (gateway wire values, llm-pi-ai) shipped with the retired card and is no longer part of this plugin — edit `llm-pi-ai` model capabilities through the official Models settings.
+
+## Japanese and Korean support status
+
+The plugin ships `ja` and `ko` dictionaries, but the current official DSH release exposes only `zh` and `en` through `LocaleRuntime`. On stock DSH, selecting Japanese or Korean fails with `locale "<id>" is not registered`.
+
+To use them before official support lands, maintain a DSH fork and update:
+
+- `packages/client/locale/src/locale-settings.ts`: add `ja` and `ko` to `LOCALE_IDS` (the Host preference schema derives from this list).
+- `packages/client/locale/src/client/index.ts`: add `{ id: 'ja', label: '日本語' }` and `{ id: 'ko', label: '한국어' }` to `LOCALES`.
+- Add the corresponding core dictionaries and tests, then rebuild and run the forked DSH.
+
+A plugin-only change cannot extend DSH's global locale list. Use the fork's documented build and official profile commands; do not manually edit a profile manifest.
+
+## 6. Troubleshooting
+
+| Symptom | Action |
+| --- | --- |
+| `dsh` is not found | Install or enable the official DSH CLI. Do not simulate profile installation with plain npm or pnpm commands. |
+| `ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION` | Add the version to `minimumReleaseAgeExclude` in the profile's `pnpm-workspace.yaml`. |
+| Plugin shows as "disabled/unmounted" with no error | Check the profile composition; the host must not value-depend on `@deepseek-ai/dsh-settings` (it does not). |
+| Client entry missing from `__DSH_BOOT__` | Confirm `exports["./client"]` exists and the host fiber was established. |
+| Model selector has no `Auto` | Confirm the adapter `resolveModel` wrapper ran (it re-runs on `llm/adapters-updated`). |
+| Settings form write fails | The value was rejected by the plugin schema; align it with the declared `.volatile()` field types. |
+| Subagent returns `UNSUPPORTED_REASONING_EFFORT` | The target model does not advertise the level; pick a supported one or restore the provider default. |
+| Stale client bundle | Hard-refresh the browser (Ctrl+Shift+R) after an upgrade. |
+
+## 7. Remove
+
+Use the official command:
+
+```bash
+dsh plugin --profile <profile> remove dsh-thinking-levels -w
+```
+
+Verify that the composed profile no longer contains the bundle:
+
+```bash
+dsh --profile <profile> --dump-default-config
+```
