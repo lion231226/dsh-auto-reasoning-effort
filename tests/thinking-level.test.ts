@@ -1,7 +1,9 @@
+import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 import {
   classifyDifficulty,
   DEFAULT_DIFFICULTY_CONFIG,
+  type Difficulty,
 } from '../src/difficulty.ts'
 import {
   EFFORT_SLIDER_RANK,
@@ -318,6 +320,116 @@ describe('classifyDifficulty — structural signals', () => {
     expect(result.reasons).toContain('short-question')
     expect(result.reasons).not.toContain('short-question(suppressed)')
   })
+})
+
+/* ── difficulty: action & orchestration words ─────────────────────────────── */
+
+describe('classifyDifficulty — action and orchestration signals', () => {
+  it('floors two build actions at the complex band regardless of length', () => {
+    const result = classifyDifficulty({ message: '新建仓库并发布插件' })
+    expect(result.score).toBeCloseTo(0.70)
+    expect(result.difficulty).toBe('complex')
+    expect(result.reasons).toContain('act:新建')
+    expect(result.reasons).toContain('act:发布')
+  })
+
+  it('does not floor a single short action', () => {
+    const result = classifyDifficulty({ message: '新建文件夹' })
+    expect(result.score).toBeCloseTo(0.05)
+    expect(result.difficulty).toBe('trivial')
+    expect(result.reasons.some(reason => reason.startsWith('act:'))).toBe(false)
+  })
+
+  it('floors a single action once the message has real context', () => {
+    // len 40 → the single-action floor applies; a 5-character order would not.
+    const message = '先把当前任务的目标、约束、验收标准和已知阻塞点都整理清楚，然后再新建一个独立仓库'
+    expect(message.length).toBeGreaterThanOrEqual(40)
+    const result = classifyDifficulty({ message })
+    expect(result.score).toBeCloseTo(0.50)
+    expect(result.difficulty).toBe('moderate')
+    expect(result.reasons).toContain('act:新建')
+  })
+
+  it('floors a plan-sized orchestration request but not a short mention', () => {
+    expect(classifyDifficulty({ message: '指导 subagents' }).difficulty).toBe('trivial')
+    expect(classifyDifficulty({ message: '指导 subagents 执行' })
+      .reasons.some(reason => reason.startsWith('orch:'))).toBe(false)
+
+    const plan = '请你作为 lead，设置清晰目标，逐步指导并监督 subagents 执行这份计划'
+    const result = classifyDifficulty({ message: plan })
+    expect(result.score).toBeCloseTo(0.70)
+    expect(result.difficulty).toBe('complex')
+    expect(result.reasons).toContain('orch:指导')
+    expect(result.reasons).toContain('orch:subagents')
+  })
+
+  it('suppresses the cheap discounts once an action floor fired', () => {
+    const result = classifyDifficulty({ message: '新建并发布插件，顺便读一下 README' })
+    expect(result.reasons).toContain('kw:读(suppressed)')
+    expect(result.difficulty).toBe('complex')
+  })
+})
+
+/* ── difficulty: multi-step lists and multi-file paths ────────────────────── */
+
+describe('classifyDifficulty — multi-step and multi-file signals', () => {
+  it('adds 0.15 for a numbered plan of two or more lines', () => {
+    const plan = '1. 新建仓库\n2. 发布插件\n3. 补 README'
+    const result = classifyDifficulty({ message: plan })
+    expect(result.reasons).toContain('steps:3')
+    // len 27 → 0.15, two actions → 0.70 floor, then the plan bonus.
+    expect(result.score).toBeCloseTo(0.85)
+  })
+
+  it('ignores a single list line', () => {
+    const result = classifyDifficulty({ message: '1. 先看日志' })
+    expect(result.reasons.some(reason => reason.startsWith('steps:'))).toBe(false)
+  })
+
+  it('adds 0.10 once two distinct paths appear', () => {
+    const result = classifyDifficulty({ message: '改 src/a.ts 和 src/b.ts' })
+    expect(result.reasons).toContain('paths:2')
+    expect(result.reasons).toContain('file-path')
+    // len 21 → 0.15, +0.10 single-path, +0.10 multi-path.
+    expect(result.score).toBeCloseTo(0.35)
+    expect(result.difficulty).toBe('simple')
+  })
+
+  it('does not count the same path twice', () => {
+    const result = classifyDifficulty({ message: '改 src/a.ts 和 src/a.ts' })
+    expect(result.reasons.some(reason => reason.startsWith('paths:'))).toBe(false)
+  })
+})
+
+/* ── difficulty: prompt regression fixture ────────────────────────────────── */
+
+interface PromptFixture {
+  id: string
+  text: string
+  expect: Difficulty
+  note?: string
+}
+
+/**
+ * Real/constructed user prompts with the expected bucket. This is the
+ * acceptance target for the second tuning round: the lists above exist to make
+ * these 16 land where the product wants them — not the other way around.
+ */
+const PROMPT_FIXTURE: PromptFixture[] = JSON.parse(
+  readFileSync(new URL('./fixtures/prompts.zh.json', import.meta.url), 'utf8'),
+) as PromptFixture[]
+
+describe('prompt regression fixture', () => {
+  for (const prompt of PROMPT_FIXTURE) {
+    it(`${prompt.id} → ${prompt.expect}`, () => {
+      const result = classifyDifficulty({ message: prompt.text })
+      expect(
+        result.difficulty,
+        `${prompt.id}: expected ${prompt.expect}, got ${result.difficulty} `
+        + `(score ${result.score.toFixed(3)}); reasons=[${result.reasons.join(',')}]`,
+      ).toBe(prompt.expect)
+    })
+  }
 })
 
 /* ── difficulty: turn context ─────────────────────────────────────────────── */

@@ -50,15 +50,16 @@ import {
   type EffortId,
   type EffortInjectionDecision,
   type HysteresisState,
+  type ToolCallSample,
 } from './thinking-level.ts'
 import { DEFAULT_DIFFICULTY_CONFIG, classifyDifficulty, type DifficultyConfig, type DifficultyResult } from './difficulty.ts'
 import { buildBillingDefinition, type PricingPolicy } from './billing-projection.ts'
+import { extractUserText } from './session-events.ts'
 import {
   EFFORT_DIFFICULTY_KEY,
   buildEffortProjectionDefinition,
   readEffortProjection,
   requestedEffortOf,
-  type EffortProjectionState,
 } from './auto-schedule-projection.ts'
 import { CONTEXT_WINDOW_MAX, CONTEXT_WINDOW_MIN } from './context-window.ts'
 import {
@@ -454,6 +455,79 @@ function asAutoEffort(level: DecidedEffort): AutoEffort {
   return level === 'low' || level === 'high' || level === 'max' ? level : 'high'
 }
 
+/** Where one step's human prompt came from. */
+export type PromptSource = 'projection' | 'pre-step' | 'no-prompt'
+
+/** The human prompt of one step plus its provenance (for logs and the status tool). */
+export interface StepPrompt {
+  /** The prompt text; `''` when no source had any. */
+  prompt: string
+  /** Which source supplied {@link prompt}. */
+  source: PromptSource
+}
+
+/**
+ * Last human prompt of one `agent/pre-step` message batch.
+ *
+ * `agent/pre-step` runs once per STEP, and a turn has several steps: only the
+ * first one carries the human prompt, later ones carry tool results (and
+ * synthetic `agent.inject()` context). Hence:
+ * - the LAST `source.kind === 'user'` message wins, because a batch may hold
+ *   several queued messages and the freshest one is what this request is about;
+ * - `undefined` means "this batch has no human message at all" — the caller
+ *   must then KEEP the prompt captured at the turn's first step;
+ * - a human message with no text yields `''` (an image-only prompt), which is
+ *   deliberately different from `undefined`: it must REPLACE the cached prompt
+ *   so a previous turn's text cannot leak into this one.
+ *
+ * Synthetic producers (`skill-invocation`, `tool-registry`, `model-selection`,
+ * `user-approval`, …) are skipped: a skill body is thousands of characters of
+ * prose and would classify as `complex`, turning every injected context into a
+ * `max` request.
+ *
+ * @param messages - the `messages` field of the `agent/pre-step` payload (any shape).
+ * @returns the prompt text (possibly `''`), or undefined when no human message exists.
+ */
+export function humanPromptOf(messages: unknown): string | undefined {
+  if (!Array.isArray(messages)) return undefined
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index]
+    if (typeof message !== 'object' || message === null) continue
+    const source = (message as { source?: unknown }).source
+    if (typeof source !== 'object' || source === null) continue
+    if ((source as { kind?: unknown }).kind !== 'user') continue
+    // `extractUserText` handles both `content` wire forms and owns the 4000 cap.
+    return extractUserText(message)
+  }
+  return undefined
+}
+
+/**
+ * Resolve the human prompt for one request from the two available sources.
+ *
+ * The projection is the authoritative per-turn view: it also carries the tool
+ * counters, and it is the ONLY source that knows about a session's explicit
+ * effort pick. The `agent/pre-step` cache is the fallback for sessions the
+ * projection registry does not serve — most importantly a subagent session
+ * created in-process by `subagent-spawn-in-process`, whose `request/header` used
+ * to go out at `safeFallback` because the projection was `undefined`.
+ *
+ * A projection that exists but holds no text (a goal continuation round, a cron
+ * trigger, an entirely synthetic turn) is treated the same as an absent one:
+ * the pre-step cache gets its chance before the hub fallback.
+ *
+ * @param projectionText - `latestUserText` of the folded state, `''` when absent.
+ * @param preStepText - the cached prompt from `agent/pre-step`, when any.
+ * @returns the prompt to classify plus where it came from.
+ */
+export function resolveStepPrompt(projectionText: string, preStepText: string | undefined): StepPrompt {
+  if (projectionText.trim().length > 0) return { prompt: projectionText, source: 'projection' }
+  if (typeof preStepText === 'string' && preStepText.trim().length > 0) {
+    return { prompt: preStepText, source: 'pre-step' }
+  }
+  return { prompt: '', source: 'no-prompt' }
+}
+
 /** What one `agent/request` should try to inject, and why. */
 export interface RequestEffortDecision {
   /**
@@ -476,27 +550,42 @@ export interface RequestEffortDecision {
   result?: DifficultyResult
   /** Hysteresis memo to persist for this session (auto scheduling path only). */
   hysteresis?: HysteresisState
-  /** The plan came from a manual intent: session pick, config lock, or `[effort: x]`. */
+  /** The decision came from a manual intent: session pick, config lock, or `[effort: x]`. */
   manual: boolean
   /**
-   * No usable evidence drove the level: the projection was unreadable, or it
-   * held no human prompt text at all (goal round / cron / synthetic-only). The
-   * level is then the safe hub, deliberately NOT `low`.
+   * No usable evidence drove the level: neither the projection nor the
+   * `pre-step` cache held a human prompt. The level is then the safe hub,
+   * deliberately NOT `low`.
    */
   fallback: boolean
 }
 
-/** Everything {@link decideRequestEffort} reads. Pure input, no host services. */
+/**
+ * Everything {@link decideRequestEffort} reads.
+ *
+ * Deliberately source-agnostic: `prompt` arrives already resolved by
+ * {@link resolveStepPrompt}, so the scheduler can run on a projection-backed
+ * session and on a `pre-step`-only session (subagents) with the same code path.
+ */
 export interface RequestEffortDecisionInput {
-  /** Folded difficulty state, or undefined when the host cannot serve one. */
-  projection: EffortProjectionState | undefined
-  /** The plugin-configured default level (the session pick shadows it). */
-  configuredLevel: EffortId
+  /**
+   * The level the request was asked for: `'auto'` to schedule, or the concrete
+   * id the session/config picked (see `requestedEffortOf`).
+   */
+  intent: string
+  /** Human prompt of this step (from {@link resolveStepPrompt}). */
+  prompt: string
+  /** Tool samples of this turn, oldest first; empty on the `pre-step` path. */
+  samples?: readonly ToolCallSample[]
+  /** Tool calls already seen in this turn. */
+  toolCount?: number
+  /** Failed tool results already seen in this turn. */
+  errors?: number
   /** Difficulty keyword tables. */
   difficulty: DifficultyConfig
   /** Consecutive proposals a candidate level needs before it takes over. */
   hysteresisSteps: number
-  /** Level used when the projection is unreadable. */
+  /** Level used when no prompt is available. */
   safeFallback: AutoEffort
   /** Scheduler preference: may drop below the hub. */
   allowDowngrade: boolean
@@ -525,19 +614,18 @@ export interface RequestEffortDecisionInput {
  *    with the same passthrough/strip contract;
  * 3. nothing else: the request is scheduled.
  *
- * Why the projection is REQUIRED for scheduling: without it there is no message
- * text and no turn counters, and guessing from a missing signal is exactly the
- * upstream defect (`[]` samples silently meant `low`). The plugin therefore
- * fails SAFE: `safeFallback` (default `high`) instead of a silent downgrade.
- * A projection that exists but holds no human text (a goal continuation round, a
- * cron trigger, or a host line whose `user/message` carries no `source`) is the
- * same "no evidence" case and also lands on the hub.
+ * A missing prompt is NOT "the easiest task": with no text the classifier would
+ * score 0.05 → `trivial` → `low`, silently downgrading every unattended turn
+ * (goal rounds, cron triggers, hosts whose `user/message` has no `source`). That
+ * case fails SAFE at the hub instead, with a synthetic `moderate` result so the
+ * log and the status tool say `reasons=no-prompt` rather than pretending the
+ * request was a manual pick.
  *
- * @param input - projection, config knobs and model capability.
- * @returns the plan; `requested === undefined` means strip.
+ * @param input - resolved prompt, turn counters, config knobs and model capability.
+ * @returns the decision; `requested === undefined` means strip.
  */
 export function decideRequestEffort(input: RequestEffortDecisionInput): RequestEffortDecision {
-  const intent = requestedEffortOf(input.projection, input.configuredLevel)
+  const { intent } = input
 
   // 1. A concrete pick (session or config) is manual intent — including a
   //    gateway-specific wire id such as `ultra`. Passing it through untouched
@@ -545,28 +633,10 @@ export function decideRequestEffort(input: RequestEffortDecisionInput): RequestE
   //    advertisement gate downstream decides pass-through vs strip.
   if (intent !== 'auto') return { intent, requested: intent, manual: true, fallback: false }
 
-  // 2. No projection: cannot classify, cannot trust tool history. Fail safe.
-  if (input.projection === undefined) {
-    return {
-      intent,
-      requested: clampForAuto(input.safeFallback, input.efforts),
-      autoLevel: input.safeFallback,
-      manual: false,
-      fallback: true,
-    }
-  }
-
-  // 3. No usable human text: this is NOT "the easiest possible task", it is
-  //    "no evidence". Two real situations land here — a goal continuation round
-  //    or cron trigger that carries no human prompt at all, and a host line
-  //    whose `user/message` has no `source` (correctly ignored as synthetic), so
-  //    no human text ever arrives. Sending an empty string through the
-  //    classifier would score 0.05 → `trivial` → `low`, i.e. silently downgrade
-  //    every unattended turn. Stay at the hub instead (same direction as
-  //    `safeFallback`), and report a synthetic `moderate` result so the log and
-  //    the status tool show `difficulty=moderate reasons=no-prompt` rather than
-  //    pretending the request was a manual pick.
-  if (input.projection.latestUserText.trim().length === 0) {
+  // 2. No usable human text: this is "no evidence", not "the easiest task".
+  //    Stay at the hub (same direction as `safeFallback`) with a synthetic
+  //    `moderate` result so the log/status stay readable.
+  if (input.prompt.trim().length === 0) {
     return {
       intent,
       requested: clampForAuto('high', input.efforts),
@@ -577,30 +647,29 @@ export function decideRequestEffort(input: RequestEffortDecisionInput): RequestE
     }
   }
 
-  // 4. Score the turn from the user's own words plus this turn's counters.
-  //    `attachments` is a fixed 0 rather than the projection's count: the host
-  //    records attachments as content blocks inside the message, and the
-  //    classifier already sees their text, so counting again would double the
-  //    signal.
+  // 3. Score the turn from the user's own words plus this turn's counters.
+  //    `attachments` is a fixed 0 rather than a folded count: the host records
+  //    attachments as content blocks inside the message, and the classifier
+  //    already sees their text, so counting again would double the signal.
   const result = classifyDifficulty({
-    message: input.projection.latestUserText,
+    message: input.prompt,
     attachments: 0,
-    priorErrors: input.projection.errors,
-    toolCount: input.projection.toolCount,
+    priorErrors: input.errors ?? 0,
+    toolCount: input.toolCount ?? 0,
   }, input.difficulty)
 
-  // 5. An in-message override is the user asking for that exact level this
+  // 4. An in-message override is the user asking for that exact level this
   //    turn: hand it through untouched (advertisement decides), never schedule.
   if (result.explicit !== undefined) {
     return { intent, requested: result.explicit, result, manual: true, fallback: false }
   }
 
-  // 6. Schedule: difficulty base, tool-history nudge, then hysteresis so one
+  // 5. Schedule: difficulty base, tool-history nudge, then hysteresis so one
   //    anomalous sample cannot flap the level for a single request.
   const decided = decideEffort({
     selected: 'auto',
     difficulty: result.difficulty,
-    recentCalls: input.projection.samples,
+    recentCalls: input.samples ?? [],
     allowDowngrade: input.allowDowngrade,
     allowUpgrade: input.allowUpgrade,
   })
@@ -656,6 +725,11 @@ export interface DecisionSnapshot {
   score: number
   /** Classifier reasons, e.g. `['len:45', 'kw:重构']`. */
   reasons: string[]
+  /**
+   * Where the classified prompt came from — the first field to look at when a
+   * subagent (or any projection-less session) behaves unexpectedly.
+   */
+  source: PromptSource
   /** ISO timestamp of the decision. */
   at: string
 }
@@ -696,6 +770,23 @@ export function buildStatusTool(describe: () => unknown): StatusToolDefinition {
 const hysteresisBySession = new WeakMap<object, HysteresisState>()
 
 /**
+ * Last human prompt per AGENT, captured by the `agent/pre-step` waterfall.
+ *
+ * Why an agent-keyed cache exists at all: the difficulty projection is served by
+ * `sessionProjections.stateOf`, which does not cover every session — a subagent
+ * session created in-process by `subagent-spawn-in-process` is the measured
+ * case. For those, the projection read returns `undefined` and the plugin used
+ * to fall back to `safeFallback` on EVERY request, so a subagent's reasoning
+ * effort was never difficulty-driven at all (a 114-character simple prompt went
+ * out at `high`).
+ *
+ * Keyed by the agent object (a `WeakMap`, so a finished agent's prompt does not
+ * outlive it) rather than by session id: the pre-step payload carries the agent,
+ * and the request payload is expected to carry the same live object.
+ */
+const promptByAgent = new WeakMap<object, string>()
+
+/**
  * Memo key for a request whose payload carries no session object (a synthetic
  * subagent step, a host line that hands the loop a detached agent). Sharing one
  * slot is better than dropping hysteresis entirely: such requests are ordered,
@@ -704,11 +795,13 @@ const hysteresisBySession = new WeakMap<object, HysteresisState>()
 const SESSIONLESS_AGENT_KEY: object = Object.freeze({})
 
 /**
- * Sessions already warned about an unreadable projection.
+ * Sessions (or agents) already warned about having no prompt at all.
  *
  * The warning is a host-log line, not a user-facing error: emitting it per
- * request would flood the log of every session on a host without the
- * projection registry.
+ * request would flood the log of every session on a host without the projection
+ * registry. It fires only when BOTH the projection and the `agent/pre-step`
+ * cache came up empty — a subagent served by the cache is working correctly and
+ * must not look like a failure.
  */
 const warnedSessions = new WeakSet<object>()
 
@@ -1165,6 +1258,41 @@ export function apply(ctx: Context, config: ThinkingLevelsConfig = DEFAULT_CONFI
   // the adapter registry changes (a route's reasoning metadata can move).
   const capability = capabilityResolver(ctx)
 
+  // Capture each step's human prompt, keyed by agent.
+  //
+  // Why this listener exists: the difficulty projection is served by
+  // `sessionProjections.stateOf`, which does not cover every session. Measured
+  // case — a session created in-process by `subagent-spawn-in-process` logs its
+  // human `user/message` (`source.kind === 'user'`, zero `model/selection`) yet
+  // the projection read returns `undefined`, so before this listener every
+  // subagent request took the `safeFallback` branch and went out at `high`
+  // regardless of a 114-character simple prompt.
+  //
+  // `agent/pre-step` is a waterfall: `next()` must be called exactly once or the
+  // step never runs. The capture is wrapped so a malformed payload can never
+  // break a turn; the plugin context disposes the listener with the fiber, like
+  // every other `ctx.on` in this file.
+  const onPreStep = ctx.on as unknown as (
+    event: string,
+    handler: (payload: Record<string, unknown>, next: () => Promise<unknown>) => Promise<unknown>,
+  ) => void
+  onPreStep('agent/pre-step', async (payload, next) => {
+    try {
+      const agent = payload.agent
+      if (typeof agent === 'object' && agent !== null) {
+        const prompt = humanPromptOf(payload.messages)
+        // `undefined` = this batch carries no human message at all (a later
+        // step of the same turn): keep the prompt captured at the turn's first
+        // step. `''` = a human message with no text, which deliberately
+        // REPLACES the cache so the previous turn's prompt cannot leak in.
+        if (prompt !== undefined) promptByAgent.set(agent, prompt)
+      }
+    } catch {
+      // Never let the capture break the step; `next()` runs below either way.
+    }
+    return next()
+  })
+
   on('agent/request', async (payload, next) => {
     const seed = await next() as { provider?: unknown; model?: unknown; reasoningEffort?: unknown }
     const cfg = current()
@@ -1178,24 +1306,44 @@ export function apply(ctx: Context, config: ThinkingLevelsConfig = DEFAULT_CONFI
     const capabilityFor = await capability.resolve(seed.provider, seed.model)
     // Folded difficulty state: human prompt text, current turn, this turn's
     // tool samples/errors/count and the session's explicit pick. `undefined` on
-    // registries without `stateOf` (0.1.0-rc.8) or before the first fold.
-    const session = (payload.agent as { session?: unknown } | undefined)?.session
+    // registries without `stateOf` (0.1.0-rc.8), on sessions the registry does
+    // not serve (in-process subagents), or before the first fold.
+    const agent = payload.agent
+    const session = (agent as { session?: unknown } | undefined)?.session
     const projection = readEffortProjection(ctx, session)
-    // Hysteresis is per session; a step without a session object (synthetic
-    // subagent step) shares one slot rather than losing the memo entirely.
-    const sessionKey = typeof session === 'object' && session !== null ? session : SESSIONLESS_AGENT_KEY
-    if (projection === undefined && !warnedSessions.has(sessionKey)) {
-      // Warn ONCE per session: a host line without the projection registry would
-      // otherwise emit this on every single request of the session.
+    // The prompt, in precedence order: the projection's folded human message,
+    // then the `agent/pre-step` capture (the subagent path), then nothing. The
+    // counters/samples are taken from the projection ONLY when it supplied the
+    // prompt: on the pre-step path there is no per-turn view to trust, and the
+    // task is to classify the TEXT, not to invent tool history.
+    const cachedPrompt = typeof agent === 'object' && agent !== null ? promptByAgent.get(agent) : undefined
+    const resolved = resolveStepPrompt(projection?.latestUserText ?? '', cachedPrompt)
+    const fromProjection = resolved.source === 'projection'
+    // Hysteresis is per session; a step without a session object (subagent
+    // step) falls back to a per-agent key so two agents never share a streak.
+    const sessionKey = typeof session === 'object' && session !== null
+      ? session
+      : typeof agent === 'object' && agent !== null ? agent : SESSIONLESS_AGENT_KEY
+    // The requested intent comes from the session pick (only the projection can
+    // hold one) shadowed over the configured default; a custom wire id stays
+    // verbatim (see `requestedEffortOf`).
+    const intent = requestedEffortOf(projection, cfg.level)
+    // Warn ONCE per session, only when BOTH sources came up empty AND the level
+    // actually has to be scheduled: a subagent served by the pre-step cache is
+    // working correctly, and a manual lock never needed a prompt at all.
+    if (resolved.source === 'no-prompt' && intent === 'auto' && !warnedSessions.has(sessionKey)) {
       warnedSessions.add(sessionKey)
       ctx.logger?.warn?.(
-        '[auto-reasoning-effort] agent/request: difficulty projection unavailable on this host; using safeFallback=%s',
+        '[auto-reasoning-effort] agent/request: no human prompt from the projection or agent/pre-step; using safeFallback=%s',
         cfg.safeFallback,
       )
     }
     const plan = decideRequestEffort({
-      projection,
-      configuredLevel: cfg.level,
+      intent,
+      prompt: resolved.prompt,
+      samples: fromProjection ? projection?.samples ?? [] : [],
+      toolCount: fromProjection ? projection?.toolCount ?? 0 : 0,
+      errors: fromProjection ? projection?.errors ?? 0 : 0,
       difficulty: cfg.difficulty,
       hysteresisSteps: cfg.hysteresisSteps,
       safeFallback: cfg.safeFallback,
@@ -1240,6 +1388,7 @@ export function apply(ctx: Context, config: ThinkingLevelsConfig = DEFAULT_CONFI
       difficulty: difficultyLabel,
       score: plan.result?.score ?? 0,
       reasons: plan.result?.reasons ?? [],
+      source: resolved.source,
       at: new Date().toISOString(),
     }
 
@@ -1252,8 +1401,7 @@ export function apply(ctx: Context, config: ThinkingLevelsConfig = DEFAULT_CONFI
       ctx.logger?.info?.(
         '[auto-reasoning-effort] agent/request: model=%s/%s user=%s seed=%s difficulty=%s score=%s reasons=%s src=%s => stripped',
         String(seed.provider), String(seed.model), plan.intent,
-        String(seed.reasoningEffort), difficultyLabel, scoreLabel, reasonsLabel,
-        projection === undefined ? 'no-projection' : 'projection',
+        String(seed.reasoningEffort), difficultyLabel, scoreLabel, reasonsLabel, resolved.source,
       )
       return stripped
     }
@@ -1262,12 +1410,15 @@ export function apply(ctx: Context, config: ThinkingLevelsConfig = DEFAULT_CONFI
     // `user=` is the ORIGINAL intent (`auto` when scheduling, the picked id
     // otherwise), never the resolved level: a support log has to make "this
     // request was scheduled" distinguishable from "the user locked a level".
+    // `src=projection|pre-step|no-prompt` answers the other support question:
+    // which source supplied the text the level was derived from.
     ctx.logger?.info?.(
       '[auto-reasoning-effort] agent/request: model=%s/%s user=%s seed=%s difficulty=%s score=%s reasons=%s tools=%d errors=%d => level=%s src=%s',
       String(seed.provider), String(seed.model), plan.intent,
       String(seed.reasoningEffort), difficultyLabel, scoreLabel, reasonsLabel,
-      projection?.samples.length ?? 0, projection?.errors ?? 0, String(decision.level),
-      projection === undefined ? 'no-projection' : 'projection',
+      fromProjection ? projection?.samples.length ?? 0 : 0,
+      fromProjection ? projection?.errors ?? 0 : 0,
+      String(decision.level), resolved.source,
     )
     return { ...seed, reasoningEffort: decision.level }
   }, { prepend: true })

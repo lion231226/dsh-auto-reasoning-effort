@@ -71,6 +71,25 @@ export interface DifficultyConfig {
   simpleKeywords: readonly string[]
   /** Acknowledgements / continuations: on short messages, scale to at most 0.2. */
   trivialKeywords: readonly string[]
+  /**
+   * Build/change verbs ("新建" / "发布" / "migrate").
+   *
+   * The original tables only knew noun-shaped difficulty ("架构", "调试"), so a
+   * real instruction such as "在 GitHub 中新建仓库，着重给插件加入…能力" scored
+   * as a one-liner: no noun was scary, yet two concrete actions were asked for.
+   * Two hits (or one hit on a 40+ character message) therefore floor the score.
+   *
+   * Optional so an existing four-table `Config` schema keeps typechecking; an
+   * absent table resolves to the default list in {@link DEFAULT_DIFFICULTY_CONFIG}.
+   */
+  actionKeywords?: readonly string[]
+  /**
+   * Coordination work ("指导" / "监督" / "subagents"): planning and running
+   * other agents is a project-sized turn even when no code is mentioned.
+   *
+   * Optional for the same compatibility reason as {@link actionKeywords}.
+   */
+  orchestrationKeywords?: readonly string[]
 }
 
 /**
@@ -78,7 +97,7 @@ export interface DifficultyConfig {
  * reports hits in; scoring is unaffected. `重构` appears twice in the spec text
  * and is de-duplicated here so a message cannot earn the same reason twice.
  */
-export const DEFAULT_DIFFICULTY_CONFIG: DifficultyConfig = Object.freeze({
+export const DEFAULT_DIFFICULTY_CONFIG: Required<DifficultyConfig> = Object.freeze({
   complexKeywords: Object.freeze([
     '重构', '架构', '设计', '调试', '排查', '迁移', '性能', '并发', '安全',
     'refactor', 'design', 'debug', 'migrate', 'optimize', 'rewrite',
@@ -95,6 +114,17 @@ export const DEFAULT_DIFFICULTY_CONFIG: DifficultyConfig = Object.freeze({
   trivialKeywords: Object.freeze([
     '谢谢', '好的', '收到', '明白', 'ok', 'okay', 'thanks', '继续', '接着',
     'next', 'continue',
+  ] as const),
+  actionKeywords: Object.freeze([
+    '新建', '搭建', '实现', '发布', '上线', '接入', '集成', '迁移', '改造',
+    '落地', '跑通', '复现', '审查', '编写', '发版', '重构', '修复', '重写',
+    'refactor', 'implement', 'migrate', 'build', 'ship', 'publish', 'deploy',
+    'integrate', 'set up', 'wire up', 'review', 'audit', 'rewrite',
+  ] as const),
+  orchestrationKeywords: Object.freeze([
+    '子代理', '并行', '编排', '引导', '指导', '监督', '协调', '拆分',
+    '整条链路', '端到端',
+    'subagent', 'subagents', 'parallel', 'pipeline', 'end-to-end',
   ] as const),
 })
 
@@ -139,6 +169,44 @@ const COMPLEX_BONUS = 0.10
  * turn every such message into a complex task.
  */
 const HEAVY_BONUS = 0.10
+
+/**
+ * Two build/change actions in one message ("新建仓库、发布插件") describe a
+ * project-sized turn, not a step: floor it at the complex band regardless of
+ * length, because the user is not asking for one edit.
+ */
+const ACTION_FLOOR = 0.70
+
+/** A single action plus real context (40+ characters) still means "do work". */
+const ACTION_SINGLE_FLOOR = 0.50
+
+/** Shorter single-action messages ("新建文件夹") are one-liners, not projects. */
+const ACTION_SINGLE_MIN_LENGTH = 40
+
+/** Coordination work (指导/监督/subagents) on a 40+ character message is a project. */
+const ORCH_FLOOR = 0.70
+
+/** Below this length a coordination word is mentioned, not planned. */
+const ORCH_MIN_LENGTH = 40
+
+/** A numbered/bulleted plan of two or more items means multi-step work. */
+const STEPS_BONUS = 0.15
+
+/** Several distinct file paths mean the change spans more than one file. */
+const PATHS_BONUS = 0.10
+
+/**
+ * One line of a numbered/bulleted list.
+ *
+ * `[^\S\n]*` is horizontal whitespace only; `\s*` after `^` (with the `m` flag)
+ * would let a match start at the end of the previous line and swallow the
+ * newline, which double-counts items. The count uses `String.match` with this
+ * global regex, so every matched line is one step.
+ */
+const STEP_LINE_RE = /^[^\S\n]*(?:\d+[.、)]|[-*])\s+/gm
+
+/** Same path vocabulary as {@link FILE_PATH_RE}, but global so paths can be counted. */
+const FILE_PATH_SCAN_RE = /[\w./\\-]+\.(?:ts|tsx|js|jsx|py|go|rs|java|json|ya?ml|toml|md|sql)\b/gi
 
 /** Discount for a cheap lookup, applied only when no expensive signal fired. */
 const SIMPLE_FACTOR = 0.7
@@ -194,14 +262,20 @@ function clamp01(score: number): number {
   return score
 }
 
+/** A config with every table present — the shape the scorer actually reads. */
+type ResolvedDifficultyConfig = Required<DifficultyConfig>
+
 /** Resolve a partial config against the defaults, field by field. */
-function resolveConfig(override?: Partial<DifficultyConfig>): DifficultyConfig {
+function resolveConfig(override?: Partial<DifficultyConfig>): ResolvedDifficultyConfig {
   if (override === undefined) return DEFAULT_DIFFICULTY_CONFIG
   return {
     complexKeywords: override.complexKeywords ?? DEFAULT_DIFFICULTY_CONFIG.complexKeywords,
     heavyKeywords: override.heavyKeywords ?? DEFAULT_DIFFICULTY_CONFIG.heavyKeywords,
     simpleKeywords: override.simpleKeywords ?? DEFAULT_DIFFICULTY_CONFIG.simpleKeywords,
     trivialKeywords: override.trivialKeywords ?? DEFAULT_DIFFICULTY_CONFIG.trivialKeywords,
+    actionKeywords: override.actionKeywords ?? DEFAULT_DIFFICULTY_CONFIG.actionKeywords,
+    orchestrationKeywords:
+      override.orchestrationKeywords ?? DEFAULT_DIFFICULTY_CONFIG.orchestrationKeywords,
   }
 }
 
@@ -318,6 +392,26 @@ export function classifyDifficulty(
     for (const word of heavyHits) reasons.push(`kw:${word}`)
   }
 
+  // Action and coordination words are the second generation of the signal set:
+  // the original tables only knew noun-shaped difficulty ("架构"), so a real
+  // instruction such as "在 GitHub 中新建仓库，着重给插件加入…能力" was scored as
+  // a one-liner. They are computed before the cheap-signal discounts so the
+  // suppression below covers them too.
+  const actionHits = matchedKeywords(lowered, config.actionKeywords)
+  const orchestrationHits = matchedKeywords(lowered, config.orchestrationKeywords)
+  // Two actions, or one action on a message with real context, is a build task.
+  // A single short action ("新建文件夹") is still a one-liner and keeps its base.
+  const actionFloor = actionHits.length >= 2
+    ? ACTION_FLOOR
+    : actionHits.length === 1 && length >= ACTION_SINGLE_MIN_LENGTH
+      ? ACTION_SINGLE_FLOOR
+      : undefined
+  // Coordination below 40 characters is usually a mention ("指导 subagents"),
+  // not a plan; a plan-sized message that asks to orchestrate is a project.
+  const orchestrationFloor = orchestrationHits.length > 0 && length >= ORCH_MIN_LENGTH
+    ? ORCH_FLOOR
+    : undefined
+
   // Cheap signals must not veto an expensive one. A polite "好的，重构一下整个
   // 模块" is still a refactor instruction, and "看看这个架构" is still an
   // architecture question; letting the acknowledgement/casual-lookup discount
@@ -325,6 +419,7 @@ export function classifyDifficulty(
   // the top level. Suppressed hits stay in `reasons[]` marked `(suppressed)`,
   // so the debug log never pretends the word was absent.
   const expensive = complexHits.length > 0 || heavyHits.length > 0
+    || actionFloor !== undefined || orchestrationFloor !== undefined
   const suppression = expensive ? SUPPRESSED : ''
 
   const simpleHits = matchedKeywords(lowered, config.simpleKeywords)
@@ -341,6 +436,17 @@ export function classifyDifficulty(
     for (const word of trivialHits) reasons.push(`kw:${word}${suppression}`)
   }
 
+  // Floors are `max`, so applying them after the discounts is equivalent — and
+  // when a floor fires the discounts were already skipped.
+  if (actionFloor !== undefined) {
+    score = Math.max(score, actionFloor)
+    for (const word of actionHits) reasons.push(`act:${word}`)
+  }
+  if (orchestrationFloor !== undefined) {
+    score = Math.max(score, orchestrationFloor)
+    for (const word of orchestrationHits) reasons.push(`orch:${word}`)
+  }
+
   if (text.includes(CODE_FENCE)) {
     score += 0.15
     reasons.push('code-block')
@@ -353,6 +459,21 @@ export function classifyDifficulty(
   if (FILE_PATH_RE.test(text)) {
     score += 0.10
     reasons.push('file-path')
+  }
+  // A plan made of two or more numbered/bulleted lines is multi-step work; the
+  // count is in the reason so the log shows how big a plan it was.
+  const stepLines = text.match(STEP_LINE_RE)
+  if (stepLines !== null && stepLines.length >= 2) {
+    score += STEPS_BONUS
+    reasons.push(`steps:${stepLines.length}`)
+  }
+  // Several distinct paths mean the change spans files. This is additive on top
+  // of `file-path`: one path says "look here", five say "this is a sweep".
+  const pathMatches = text.match(FILE_PATH_SCAN_RE) ?? []
+  const distinctPaths = new Set(pathMatches)
+  if (distinctPaths.size >= 2) {
+    score += PATHS_BONUS
+    reasons.push(`paths:${distinctPaths.size}`)
   }
   // Trailing question mark on a short message: a clarification, not a task.
   // Same cheap-vs-expensive rule as the keyword discounts — "重构这个模块？" is

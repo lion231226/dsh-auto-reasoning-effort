@@ -1,0 +1,94 @@
+[
+  {
+    "id": "research-market",
+    "text": "从github和 插件市场（dsh-market） 中查找一下有没有可以使 DSH推理等级 AUTO 调节的插件？",
+    "expect": "trivial",
+    "note": "短问句检索：思考不是瓶颈（几次搜索即可），低档合理；Lead 于 v0.1.1 从 simple 下调为 trivial"
+  },
+  {
+    "id": "review-source",
+    "text": "你去看一下 dsh-thinking-levels 的源代码，看看这个插件的 auto 实现逻辑是否合理？AUTO是如何判断的？是否存在明显的缺陷？",
+    "expect": "complex",
+    "note": "源码审查：complex 词（审查语义由 源代码/缺陷 承载）"
+  },
+  {
+    "id": "build-plugin",
+    "text": "我们改成自己发布的插件。请在 GitHub 中新建仓库，着重给插件加入根据任务难度实时智能调节任务难度的能力。",
+    "expect": "complex",
+    "note": "两个动作词（新建/发布）→ 一段构建指令，不能被短句长度压低"
+  },
+  {
+    "id": "orchestrate-team",
+    "text": "同意，请你作为lead，设置清晰目标，指导并监督 subagents 执行。可以 fork 上游MIT代码。我们的插件也MIT",
+    "expect": "complex",
+    "note": "编排类：指导/监督/subagents"
+  },
+  {
+    "id": "small-constraint",
+    "text": "另外，新插件代码不要在 TEMP目录下，而是在本项目文件夹下新建文件夹",
+    "expect": "simple",
+    "note": "单个动作词 + 短句 → 不应升到 complex"
+  },
+  {
+    "id": "setup-question",
+    "text": "先做1 ，然后发npm，不过npm我好像没有开发好，所以得先停一下，告知我如何设置",
+    "expect": "simple",
+    "note": "问答 + 一步操作"
+  },
+  {
+    "id": "short-verify",
+    "text": "那我现在切到了 auto 模式。你实际跑一下看看难度驱动的 AUTO是否运转正常？",
+    "expect": "trivial",
+    "note": "短问句 + 廉价词；后续轮的 toolCount/errors 会把它抬上去"
+  },
+  {
+    "id": "short-question",
+    "text": "做A的意义是什么呢？",
+    "expect": "trivial"
+  },
+  {
+    "id": "restate",
+    "text": "首先复述当前任务及目标",
+    "expect": "trivial"
+  },
+  {
+    "id": "continue",
+    "text": "继续",
+    "expect": "trivial"
+  },
+  {
+    "id": "continue-2",
+    "text": "继续执行",
+    "expect": "trivial"
+  },
+  {
+    "id": "refactor-short",
+    "text": "重构这个模块",
+    "expect": "complex",
+    "note": "complex 词地板 0.60 + 0.10 = 0.70"
+  },
+  {
+    "id": "readme-read",
+    "text": "读一下 README",
+    "expect": "trivial",
+    "note": "廉价词仍生效"
+  },
+  {
+    "id": "english-all-false-positive",
+    "text": "install the package",
+    "expect": "trivial",
+    "note": "ASCII 词边界：all 不得命中 install"
+  },
+  {
+    "id": "english-action-chain",
+    "text": "Refactor the scheduler and migrate the projection to the new schema. Then publish a new release and update the README.",
+    "expect": "complex",
+    "note": "英文动作词链（refactor/migrate/publish）"
+  },
+  {
+    "id": "tiny-fix",
+    "text": "修一下这个 bug",
+    "expect": "trivial",
+    "note": "极短单点修复：允许低档，后续轮错误信号会升级"
+  }
+]
