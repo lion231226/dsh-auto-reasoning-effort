@@ -24,7 +24,7 @@
  * `wire.viewSchema.parse()` (dsh-session-projection lib:255/259/305), so these
  * MUST be real zod objects — schemastery has no parse. zod ^4.4.3 rides in
  * dependencies (TL's tsc build does not bundle).
- * @module dsh-thinking-levels/billing-projection
+ * @module dsh-auto-reasoning-effort/billing-projection
  */
 import { z } from 'zod'
 import {

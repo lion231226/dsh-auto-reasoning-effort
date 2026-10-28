@@ -1,5 +1,5 @@
 /**
- * dsh-thinking-levels host plugin: injects a user-selected or auto-scheduled
+ * dsh-auto-reasoning-effort host plugin: injects a user-selected or auto-scheduled
  * `reasoning_effort` into every `agent/request` waterfall (levels: off / on /
  * minimal / low / medium / high / xhigh / max / auto), and records per-tool
  * wall-clock durations for telemetry.
@@ -38,10 +38,28 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { Volatile } from '@deepseek-ai/cosmokit'
 import z from '@deepseek-ai/schemastery'
-import { assertEffortId, reasoningEffortSupported, resolveEffortInjection, type EffortId } from './thinking-level.ts'
+import {
+  applyHysteresis,
+  assertEffortId,
+  clampForAuto,
+  decideEffort,
+  reasoningEffortSupported,
+  resolveEffortInjection,
+  type AutoEffort,
+  type DecidedEffort,
+  type EffortId,
+  type EffortInjectionDecision,
+  type HysteresisState,
+} from './thinking-level.ts'
+import { DEFAULT_DIFFICULTY_CONFIG, classifyDifficulty, type DifficultyConfig, type DifficultyResult } from './difficulty.ts'
 import { buildBillingDefinition, type PricingPolicy } from './billing-projection.ts'
-import { recentToolCalls } from './session-events.ts'
-import { buildAutoScheduleDefinition, readAutoSchedule, requestedEffortOf } from './auto-schedule-projection.ts'
+import {
+  EFFORT_DIFFICULTY_KEY,
+  buildEffortProjectionDefinition,
+  readEffortProjection,
+  requestedEffortOf,
+  type EffortProjectionState,
+} from './auto-schedule-projection.ts'
 import { CONTEXT_WINDOW_MAX, CONTEXT_WINDOW_MIN } from './context-window.ts'
 import {
   PI_AI_NAMESPACE,
@@ -107,6 +125,18 @@ export interface ThinkingLevelsConfig {
    * 目录内模型自动按条目地区计价，不受本项影响。
    */
   defaultPricing: PricingPolicy | Volatile<PricingPolicy>
+  /** Difficulty keyword tables and the classifier's tuning surface (SPEC §2.3). */
+  difficulty?: DifficultyConfig
+  /**
+   * Consecutive identical scheduler proposals required before the level
+   * switches (SPEC §3.1). 1 disables hysteresis.
+   */
+  hysteresisSteps: number | Volatile<number>
+  /**
+   * Level injected when the difficulty projection cannot be read (SPEC §5.2).
+   * The safe direction is the hub, never `low`.
+   */
+  safeFallback: AutoEffort | Volatile<AutoEffort>
 }
 
 const effortId = z.union(['off', 'on', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'])
@@ -125,6 +155,59 @@ const modelsSchema = z.dict(z.object({
 const defaultPricingSchema = z.union(['estimate', 'cn', 'global', 'custom', 'off']).default('estimate')
 
 /**
+ * The difficulty keyword tables (SPEC §2.3), shared by the schema default and
+ * `DEFAULT_CONFIG` so the two can never drift.
+ *
+ * The lists live in `difficulty.ts` (`DEFAULT_DIFFICULTY_CONFIG`) rather than
+ * being repeated here: the classifier and the settings surface must show the
+ * SAME words, otherwise the status tool would report a table the scorer does
+ * not use. Copies are made per call because schemastery may hand one parsed
+ * object to several readers, and a caller that sorted a list in place must not
+ * reorder the next parse.
+ */
+const defaultDifficulty = () => ({
+  complexKeywords: [...DEFAULT_DIFFICULTY_CONFIG.complexKeywords],
+  heavyKeywords: [...DEFAULT_DIFFICULTY_CONFIG.heavyKeywords],
+  simpleKeywords: [...DEFAULT_DIFFICULTY_CONFIG.simpleKeywords],
+  trivialKeywords: [...DEFAULT_DIFFICULTY_CONFIG.trivialKeywords],
+})
+
+/**
+ * Module-level fallback handed to `readVolatile` when a host supplies no
+ * `difficulty` value at all. Shared on purpose: it is only ever read, and
+ * rebuilding four arrays on every `agent/request` would allocate per request
+ * for no reason.
+ */
+const DIFFICULTY_FALLBACK: DifficultyConfig = defaultDifficulty()
+
+/**
+ * Difficulty-signal configuration (SPEC §5.3). Deliberately NOT volatile: the
+ * keyword tables are a domain-tuning surface, not a per-turn knob, and a live
+ * ref would have to be read through on every request for no benefit.
+ */
+const difficultySchema = z.object({
+  complexKeywords: z.array(z.string()).default(DEFAULT_DIFFICULTY_CONFIG.complexKeywords.slice()),
+  heavyKeywords: z.array(z.string()).default(DEFAULT_DIFFICULTY_CONFIG.heavyKeywords.slice()),
+  simpleKeywords: z.array(z.string()).default(DEFAULT_DIFFICULTY_CONFIG.simpleKeywords.slice()),
+  trivialKeywords: z.array(z.string()).default(DEFAULT_DIFFICULTY_CONFIG.trivialKeywords.slice()),
+}).default(defaultDifficulty())
+
+/**
+ * Hysteresis depth (SPEC §3.1): consecutive proposals a candidate level needs
+ * before it takes over. 1 disables hysteresis; 10 is a deliberately slow gear.
+ */
+const hysteresisStepsSchema = z.number().step(1).min(1).max(10).default(2)
+
+/**
+ * Fail-safe level when the projection cannot be read (SPEC §5.2 step 5).
+ *
+ * `high` (the hub) is the safe direction: a broken projection must not silently
+ * downgrade every turn to `low`, which is what upstream did by collapsing an
+ * unreadable sampler to "no calls ⇒ low".
+ */
+const safeFallbackSchema = z.union(['low', 'high', 'max']).default('high')
+
+/**
  * Composition-entry schema: what a dsh profile may configure at assembly
  * time (cordis.yml `config:` of the plugin row). The same schema doubles as
  * the settings surface: DSH 0.1.7 renders the plugin's settings form from the
@@ -139,6 +222,9 @@ export const Config = z.object({
   takeover: z.boolean().default(false).volatile(),
   takeoverUi: z.boolean().default(false).volatile(),
   defaultPricing: defaultPricingSchema.volatile(),
+  difficulty: difficultySchema,
+  hysteresisSteps: hysteresisStepsSchema.volatile(),
+  safeFallback: safeFallbackSchema.volatile(),
   models: modelsSchema,
 })
 
@@ -157,6 +243,9 @@ export const LegacyConfig = z.object({
   takeover: z.boolean().default(false),
   takeoverUi: z.boolean().default(false),
   defaultPricing: defaultPricingSchema,
+  difficulty: difficultySchema,
+  hysteresisSteps: hysteresisStepsSchema,
+  safeFallback: safeFallbackSchema,
   models: modelsSchema,
 })
 
@@ -169,6 +258,9 @@ export const DEFAULT_CONFIG: ThinkingLevelsConfig = {
   takeover: false,
   takeoverUi: false,
   defaultPricing: 'estimate',
+  difficulty: defaultDifficulty(),
+  hysteresisSteps: 2,
+  safeFallback: 'high',
   models: {},
 }
 
@@ -209,6 +301,9 @@ interface LiveConfig {
   takeover: boolean
   takeoverUi: boolean
   defaultPricing: PricingPolicy
+  difficulty: DifficultyConfig
+  hysteresisSteps: number
+  safeFallback: AutoEffort
   models: Record<string, ModelCapabilityOverride>
 }
 
@@ -227,6 +322,9 @@ function resolveLiveConfig(config: ThinkingLevelsConfig): LiveConfig {
     takeover: readVolatile(config.takeover, false),
     takeoverUi: readVolatile(config.takeoverUi, false),
     defaultPricing: readVolatile(config.defaultPricing, 'estimate'),
+    difficulty: config.difficulty ?? DIFFICULTY_FALLBACK,
+    hysteresisSteps: readVolatile(config.hysteresisSteps, 2),
+    safeFallback: readVolatile(config.safeFallback, 'high'),
     models: config.models,
   }
 }
@@ -338,6 +436,316 @@ export function advertiseModelCapability(
       info.reasoning = { ...reasoning, efforts }
       return info
     }
+  }
+}
+
+/* ───────────────── difficulty-driven request planning ───────────────── */
+
+/**
+ * Narrow a scheduler decision onto the auto trio.
+ *
+ * {@link decideEffort} returns the wider `DecidedEffort` because the manual
+ * branch can pass `minimal` / `medium` / `xhigh` through. The `selected: 'auto'`
+ * path — the only one used here — returns `baseEffortFor` / tool tuning
+ * results, i.e. always one of `low` / `high` / `max`; the fallback keeps the
+ * function total instead of casting the type system away.
+ */
+function asAutoEffort(level: DecidedEffort): AutoEffort {
+  return level === 'low' || level === 'high' || level === 'max' ? level : 'high'
+}
+
+/** What one `agent/request` should try to inject, and why. */
+export interface RequestEffortDecision {
+  /**
+   * The original intent: `'auto'` when the request is to be scheduled, or the
+   * id the user/config asked for. Kept verbatim — a gateway's custom wire id
+   * (`ultra`) is a real user choice, not an unknown level to discard — so it is
+   * `string` rather than {@link EffortId}.
+   */
+  intent: string
+  /**
+   * The level to hand to {@link resolveEffortInjection} as its `requested`
+   * (manual) input — already clamped onto the model's advertised levels.
+   * `undefined` means the auto path found no advertised level at all, so the
+   * caller must strip `reasoningEffort`.
+   */
+  requested: string | undefined
+  /** Post-hysteresis auto level, before the capability clamp (logging only). */
+  autoLevel?: AutoEffort
+  /** Classifier output, when the auto path ran (logging + status tool). */
+  result?: DifficultyResult
+  /** Hysteresis memo to persist for this session (auto scheduling path only). */
+  hysteresis?: HysteresisState
+  /** The plan came from a manual intent: session pick, config lock, or `[effort: x]`. */
+  manual: boolean
+  /**
+   * No usable evidence drove the level: the projection was unreadable, or it
+   * held no human prompt text at all (goal round / cron / synthetic-only). The
+   * level is then the safe hub, deliberately NOT `low`.
+   */
+  fallback: boolean
+}
+
+/** Everything {@link decideRequestEffort} reads. Pure input, no host services. */
+export interface RequestEffortDecisionInput {
+  /** Folded difficulty state, or undefined when the host cannot serve one. */
+  projection: EffortProjectionState | undefined
+  /** The plugin-configured default level (the session pick shadows it). */
+  configuredLevel: EffortId
+  /** Difficulty keyword tables. */
+  difficulty: DifficultyConfig
+  /** Consecutive proposals a candidate level needs before it takes over. */
+  hysteresisSteps: number
+  /** Level used when the projection is unreadable. */
+  safeFallback: AutoEffort
+  /** Scheduler preference: may drop below the hub. */
+  allowDowngrade: boolean
+  /** User preference: may lift above the hub to `max`. */
+  allowUpgrade: boolean
+  /** The model's advertised effort ids (including plugin masks like `auto`). */
+  efforts: readonly string[]
+  /** Hysteresis memo from the previous request of this session. */
+  previous?: HysteresisState
+}
+
+/**
+ * Decide one request's effort target, without touching any host service.
+ *
+ * Order (SPEC §5.2, Lead-confirmed): manual intent → difficulty → scheduler →
+ * hysteresis → capability clamp. The clamp happens HERE rather than inside
+ * {@link resolveEffortInjection} so the level the request carries is a decided
+ * value; `resolveEffortInjection` is then only the "is this model allowed to
+ * receive it at all" gate (advertisement, `toggleOnly`, no-reasoning models).
+ *
+ * Three ways a level can be manual:
+ * 1. the session's `model/selection` pick (or the configured default when the
+ *    session never picked) is a concrete level — a user choice always wins over
+ *    scheduling;
+ * 2. the message itself asks for one (`[effort: max]`) — a per-turn user intent
+ *    with the same passthrough/strip contract;
+ * 3. nothing else: the request is scheduled.
+ *
+ * Why the projection is REQUIRED for scheduling: without it there is no message
+ * text and no turn counters, and guessing from a missing signal is exactly the
+ * upstream defect (`[]` samples silently meant `low`). The plugin therefore
+ * fails SAFE: `safeFallback` (default `high`) instead of a silent downgrade.
+ * A projection that exists but holds no human text (a goal continuation round, a
+ * cron trigger, or a host line whose `user/message` carries no `source`) is the
+ * same "no evidence" case and also lands on the hub.
+ *
+ * @param input - projection, config knobs and model capability.
+ * @returns the plan; `requested === undefined` means strip.
+ */
+export function decideRequestEffort(input: RequestEffortDecisionInput): RequestEffortDecision {
+  const intent = requestedEffortOf(input.projection, input.configuredLevel)
+
+  // 1. A concrete pick (session or config) is manual intent — including a
+  //    gateway-specific wire id such as `ultra`. Passing it through untouched
+  //    is what keeps the plugin from overriding an explicit user choice; the
+  //    advertisement gate downstream decides pass-through vs strip.
+  if (intent !== 'auto') return { intent, requested: intent, manual: true, fallback: false }
+
+  // 2. No projection: cannot classify, cannot trust tool history. Fail safe.
+  if (input.projection === undefined) {
+    return {
+      intent,
+      requested: clampForAuto(input.safeFallback, input.efforts),
+      autoLevel: input.safeFallback,
+      manual: false,
+      fallback: true,
+    }
+  }
+
+  // 3. No usable human text: this is NOT "the easiest possible task", it is
+  //    "no evidence". Two real situations land here — a goal continuation round
+  //    or cron trigger that carries no human prompt at all, and a host line
+  //    whose `user/message` has no `source` (correctly ignored as synthetic), so
+  //    no human text ever arrives. Sending an empty string through the
+  //    classifier would score 0.05 → `trivial` → `low`, i.e. silently downgrade
+  //    every unattended turn. Stay at the hub instead (same direction as
+  //    `safeFallback`), and report a synthetic `moderate` result so the log and
+  //    the status tool show `difficulty=moderate reasons=no-prompt` rather than
+  //    pretending the request was a manual pick.
+  if (input.projection.latestUserText.trim().length === 0) {
+    return {
+      intent,
+      requested: clampForAuto('high', input.efforts),
+      autoLevel: 'high',
+      result: { difficulty: 'moderate', score: 0.45, reasons: ['no-prompt'] },
+      manual: false,
+      fallback: true,
+    }
+  }
+
+  // 4. Score the turn from the user's own words plus this turn's counters.
+  //    `attachments` is a fixed 0 rather than the projection's count: the host
+  //    records attachments as content blocks inside the message, and the
+  //    classifier already sees their text, so counting again would double the
+  //    signal.
+  const result = classifyDifficulty({
+    message: input.projection.latestUserText,
+    attachments: 0,
+    priorErrors: input.projection.errors,
+    toolCount: input.projection.toolCount,
+  }, input.difficulty)
+
+  // 5. An in-message override is the user asking for that exact level this
+  //    turn: hand it through untouched (advertisement decides), never schedule.
+  if (result.explicit !== undefined) {
+    return { intent, requested: result.explicit, result, manual: true, fallback: false }
+  }
+
+  // 6. Schedule: difficulty base, tool-history nudge, then hysteresis so one
+  //    anomalous sample cannot flap the level for a single request.
+  const decided = decideEffort({
+    selected: 'auto',
+    difficulty: result.difficulty,
+    recentCalls: input.projection.samples,
+    allowDowngrade: input.allowDowngrade,
+    allowUpgrade: input.allowUpgrade,
+  })
+  const hysteresis = applyHysteresis(input.previous, asAutoEffort(decided), input.hysteresisSteps)
+  return {
+    intent,
+    requested: clampForAuto(hysteresis.level, input.efforts),
+    autoLevel: hysteresis.level,
+    result,
+    hysteresis,
+    manual: false,
+    fallback: false,
+  }
+}
+
+/* ─────────────────────── diagnostics tool ─────────────────────── */
+
+/** One text block of the diagnostic tool's model-facing content. */
+interface StatusContentBlock {
+  type: 'text'
+  text: string
+}
+
+/**
+ * A hand-built `ToolDefinition` (the host contract `@deepseek-ai/dsh-tools`
+ * validates). Built by hand instead of via `defineTool` because this plugin
+ * deliberately ships no new runtime dependency (SPEC §8: only `schemastery` and
+ * `zod`), and the host resolves nothing for it — `dsh-tools` is not installed
+ * in a profile's node_modules, so a value import would make the whole plugin
+ * fail to load.
+ */
+interface StatusToolDefinition {
+  name: string
+  description: string
+  parameters: Record<string, unknown>
+  output: {
+    schema: Record<string, unknown>
+    render: (args: unknown, value: unknown) => StatusContentBlock[]
+  }
+  execute: (args: unknown, exec: unknown) => Promise<unknown>
+}
+
+/** The diagnostic tool's name. No other tool in this plugin uses the registry. */
+export const STATUS_TOOL_NAME = 'auto_reasoning_effort_status'
+
+/** The last decision of this process, as the status tool reports it. */
+export interface DecisionSnapshot {
+  /** Injected wire level, or `'none'` when the field was stripped. */
+  level: string
+  /** Difficulty bucket, `'manual'` for a user pick, `'fallback'` for safe mode. */
+  difficulty: string
+  /** Classifier score (0 when no classification ran). */
+  score: number
+  /** Classifier reasons, e.g. `['len:45', 'kw:重构']`. */
+  reasons: string[]
+  /** ISO timestamp of the decision. */
+  at: string
+}
+
+/**
+ * Build the `auto_reasoning_effort_status` definition over a live snapshot
+ * supplier.
+ *
+ * The output schema is intentionally open (`additionalProperties: true`): the
+ * payload mirrors the config surface, and pinning it would turn every future
+ * config field into a hard `ToolOutputError` at call time. The value is
+ * human/model-readable JSON, so the text render is the whole contract.
+ */
+export function buildStatusTool(describe: () => unknown): StatusToolDefinition {
+  return {
+    name: STATUS_TOOL_NAME,
+    description: 'Report the live auto-reasoning-effort configuration and the most recent '
+      + 'difficulty-driven decision (level, difficulty score, reasons, timestamp). '
+      + 'Use it when the injected reasoning effort looks wrong, or to confirm which '
+      + 'difficulty signals the scheduler saw for the last request.',
+    parameters: { type: 'object', properties: {}, required: [], additionalProperties: false },
+    output: {
+      schema: { type: 'object', additionalProperties: true },
+      render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
+    },
+    execute: async () => describe(),
+  }
+}
+
+/**
+ * Hysteresis memos keyed by the live session object.
+ *
+ * A `WeakMap` (not a `Map` keyed by session id): the memo must die with the
+ * session, and a reloaded plugin must not resurrect a stale streak. Sessions
+ * are plain objects on every supported host line, so the object key is stable
+ * for the life of the session.
+ */
+const hysteresisBySession = new WeakMap<object, HysteresisState>()
+
+/**
+ * Memo key for a request whose payload carries no session object (a synthetic
+ * subagent step, a host line that hands the loop a detached agent). Sharing one
+ * slot is better than dropping hysteresis entirely: such requests are ordered,
+ * so a shared streak still damps flapping.
+ */
+const SESSIONLESS_AGENT_KEY: object = Object.freeze({})
+
+/**
+ * Sessions already warned about an unreadable projection.
+ *
+ * The warning is a host-log line, not a user-facing error: emitting it per
+ * request would flood the log of every session on a host without the
+ * projection registry.
+ */
+const warnedSessions = new WeakSet<object>()
+
+/**
+ * Most recent decision of this process, for {@link STATUS_TOOL_NAME}.
+ *
+ * Module-level rather than per-`apply`: the diagnostics tool is registered by
+ * the `tools` service, which outlives a plugin remount, and "the last decision"
+ * is a property of the process's request traffic, not of one fiber.
+ */
+let lastDecision: DecisionSnapshot | null = null
+
+/**
+ * Snapshot reported by {@link STATUS_TOOL_NAME}.
+ *
+ * Field names mirror the config surface one-to-one (`hysteresisSteps`,
+ * `safeFallback`, …) so an operator can diff the tool output against the
+ * settings form without a translation table.
+ */
+function statusSnapshot(cfg: LiveConfig, last: DecisionSnapshot | null): Record<string, unknown> {
+  return {
+    plugin: 'dsh-auto-reasoning-effort',
+    enabled: cfg.enabled,
+    level: cfg.level,
+    allowDowngrade: cfg.allowDowngrade,
+    allowUpgrade: cfg.allowUpgrade,
+    hysteresisSteps: cfg.hysteresisSteps,
+    safeFallback: cfg.safeFallback,
+    defaultPricing: cfg.defaultPricing,
+    difficulty: {
+      complexKeywords: [...cfg.difficulty.complexKeywords],
+      heavyKeywords: [...cfg.difficulty.heavyKeywords],
+      simpleKeywords: [...cfg.difficulty.simpleKeywords],
+      trivialKeywords: [...cfg.difficulty.trivialKeywords],
+    },
+    models: cfg.models,
+    lastDecision: last,
   }
 }
 
@@ -505,7 +913,7 @@ const THINKING_LEVELS_SETTINGS_NAMESPACE = 'thinking-levels'
 const TAKEOVER_SYNC_NAMESPACES: readonly string[] = [
   PI_AI_NAMESPACE,
   ...TAKEOVER_NAMESPACE_CANDIDATES,
-  'dsh-thinking-levels',
+  'dsh-auto-reasoning-effort',
   THINKING_LEVELS_SETTINGS_NAMESPACE,
 ]
 
@@ -528,7 +936,7 @@ export function installLegacySection(
     const settings = sctx.settings as
       | { register?: unknown; describe?: unknown; installSection?: unknown }
       | undefined
-    console.log(`[dsh-thinking-levels] settings service face: register=${typeof settings?.register} installSection=${typeof settings?.installSection} describe=${typeof settings?.describe}`)
+    console.log(`[auto-reasoning-effort] settings service face: register=${typeof settings?.register} installSection=${typeof settings?.installSection} describe=${typeof settings?.describe}`)
     // `register`'s presence IS the imperative face (≤0.1.6). `describe` must
     // NOT be read as a declarative-generation marker: the webServer mirror
     // carries describe/mutate on EVERY generation (三代腰 finding —
@@ -551,20 +959,27 @@ export function installLegacySection(
         allowUpgrade: readVolatile(config.allowUpgrade, false),
         takeover: readVolatile(config.takeover, false),
         takeoverUi: readVolatile(config.takeoverUi, false),
+        // The difficulty knobs ride the same base layer as the rest: on a
+        // ≤0.1.6 host the registered section is what `current()` reads, so a
+        // composition-entry keyword table that is not carried here would be
+        // silently replaced by the schema defaults.
+        difficulty: config.difficulty ?? DIFFICULTY_FALLBACK,
+        hysteresisSteps: readVolatile(config.hysteresisSteps, 2),
+        safeFallback: readVolatile(config.safeFallback, 'high'),
         models: config.models,
       }
       const scope = settings.register(THINKING_LEVELS_SETTINGS_NAMESPACE, LegacyConfig, { base: plainBase }) as {
         get(): unknown
         watch?(cb: () => void): void
       }
-      console.log('[dsh-thinking-levels] settings via settings.register (≤0.1.6 imperative face)')
+      console.log('[auto-reasoning-effort] settings via settings.register (≤0.1.6 imperative face)')
       hooks.setSource(() => scope.get() as ThinkingLevelsConfig)
       sctx.effect(() => () => {
         hooks.setSource(() => config)
       })
       scope.watch?.(() => {})
     } catch (error) {
-      console.log(`[dsh-thinking-levels] settings.register FAILED: ${error instanceof Error ? error.message : String(error)}`)
+      console.log(`[auto-reasoning-effort] settings.register FAILED: ${error instanceof Error ? error.message : String(error)}`)
     }
   })
 }
@@ -578,7 +993,7 @@ export function apply(ctx: Context, config: ThinkingLevelsConfig = DEFAULT_CONFI
   // Fail-loud: a stray config value (e.g. `medium` from an old profile) must
   // not ride through into the model request, where dsh throws
   // UNSUPPORTED_REASONING_EFFORT per request.
-  assertEffortId(resolveLiveConfig(config).level, 'dsh-thinking-levels config.level')
+  assertEffortId(resolveLiveConfig(config).level, 'dsh-auto-reasoning-effort config.level')
 
   // Runtime-adjustable configuration: volatile refs on 0.1.7+, the registered
   // section before that — both re-read per request, so a committed settings
@@ -621,20 +1036,19 @@ export function apply(ctx: Context, config: ThinkingLevelsConfig = DEFAULT_CONFI
     }
       scope.sessionProjections?.register(def)
     } catch (error) {
-      console.warn(`[dsh-thinking-levels] tlCacheBilling register failed (billing section stays hidden): ${error instanceof Error ? error.message : String(error)}`)
+      console.warn(`[auto-reasoning-effort] tlCacheBilling register failed (billing section stays hidden): ${error instanceof Error ? error.message : String(error)}`)
     }
   })
   const current: () => LiveConfig = () => resolveLiveConfig(source())
-  // Auto-schedule projection (issue #6): folds `tool/call` into the scheduler's
-  // sample ring and `model/selection` into the session's explicit pick. Same
-  // soft coupling and same "never poison the fiber" rule as the billing unit
-  // above — a registry that cannot serve `stateOf` is skipped outright rather
-  // than registered blind:
+  // Difficulty projection (`tlEffortDifficulty`): folds the human prompt text,
+  // the turn switch, the per-turn tool samples and the session's explicit pick.
+  // Same soft coupling and same "never poison the fiber" rule as the billing
+  // unit above — a registry that cannot serve `stateOf` is skipped outright
+  // rather than registered blind:
   // - 0.1.0-rc.8 is the legacy plane-contract registry (`schema`/`view`, no
   //   `stateOf`), and a unit missing `schema` there poisons every cold session
   //   load.
-  // - where it is skipped, the scheduler falls back to the legacy
-  //   `session.events` read, which is exactly right for that one host line.
+  // - where it is skipped, the injection path falls back to `safeFallback`.
   ;(ctx as unknown as {
     inject?: (deps: string[], cb: (scope: { sessionProjections?: unknown }) => void) => void
   }).inject?.(['sessionProjections'], (scope) => {
@@ -643,13 +1057,13 @@ export function apply(ctx: Context, config: ThinkingLevelsConfig = DEFAULT_CONFI
       | undefined
     if (typeof registry?.stateOf !== 'function' || typeof registry.register !== 'function') return
     try {
-      registry.register(buildAutoScheduleDefinition())
+      registry.register(buildEffortProjectionDefinition())
     } catch (error) {
-      console.warn(`[dsh-thinking-levels] tlAutoSchedule register failed (auto falls back to the legacy read): ${error instanceof Error ? error.message : String(error)}`)
+      console.warn(`[auto-reasoning-effort] ${EFFORT_DIFFICULTY_KEY} register failed (auto falls back to safeFallback): ${error instanceof Error ? error.message : String(error)}`)
     }
   })
   ctx.on('loader/volatile-update', () => {
-    assertEffortId(resolveLiveConfig(config).level, 'dsh-thinking-levels config.level')
+    assertEffortId(resolveLiveConfig(config).level, 'dsh-auto-reasoning-effort config.level')
     // A flipped takeover switch mirrors immediately (identity-gated).
     syncTakeover()
   })
@@ -681,10 +1095,10 @@ export function apply(ctx: Context, config: ThinkingLevelsConfig = DEFAULT_CONFI
       if (next === undefined || next === piAi) return
       await settings?.update?.(PI_AI_NAMESPACE, { providers: next.providers })
       ctx.logger?.info?.(
-        '[thinking-levels] official-compat: supportsDeveloperRole=false (route) and thinkingFormat=qwen (toggle-style models) written to llm-pi-ai for custom thinking routes',
+        '[auto-reasoning-effort] official-compat: supportsDeveloperRole=false (route) and thinkingFormat=qwen (toggle-style models) written to llm-pi-ai for custom thinking routes',
       )
     }).catch((error) => {
-      ctx.logger?.warn?.('[thinking-levels] developer-role compat sync rejected (schema gate); kept previous section', error)
+      ctx.logger?.warn?.('[auto-reasoning-effort] developer-role compat sync rejected (schema gate); kept previous section', error)
     })
   }
 
@@ -708,9 +1122,9 @@ export function apply(ctx: Context, config: ThinkingLevelsConfig = DEFAULT_CONFI
       if (patch === undefined || transport === undefined) return
       const settings = ctx.get('settings') as SettingsWriteLike | undefined
       await settings?.update?.(transport.ns, patch)
-      ctx.logger?.info?.('[thinking-levels] takeover switch %s written to %s.enabled', String(current().takeover), transport.ns)
+      ctx.logger?.info?.('[auto-reasoning-effort] takeover switch %s written to %s.enabled', String(current().takeover), transport.ns)
     }).catch((error) => {
-      ctx.logger?.warn?.('[thinking-levels] takeover mirror write rejected (schema gate); kept previous section', error)
+      ctx.logger?.warn?.('[auto-reasoning-effort] takeover mirror write rejected (schema gate); kept previous section', error)
     })
   }
 
@@ -762,48 +1176,124 @@ export function apply(ctx: Context, config: ThinkingLevelsConfig = DEFAULT_CONFI
     // Unsupported fields are stripped, not sent; a resolved low/auto schedule
     // only ever reaches models whose metadata admits the level.
     const capabilityFor = await capability.resolve(seed.provider, seed.model)
-    // Folded projection state (issue #6): recent tool samples + the session's
-    // explicit pick. `undefined` on registries without `stateOf` (0.1.0-rc.8).
+    // Folded difficulty state: human prompt text, current turn, this turn's
+    // tool samples/errors/count and the session's explicit pick. `undefined` on
+    // registries without `stateOf` (0.1.0-rc.8) or before the first fold.
     const session = (payload.agent as { session?: unknown } | undefined)?.session
-    const autoSchedule = readAutoSchedule(ctx, session)
-    const calls = autoSchedule?.samples ?? recentToolCalls(payload.agent)
-    // Intent comes from the session/config, never from the seed: the host
-    // echoes this plugin's own last injection back through the header.
-    const requested = requestedEffortOf(autoSchedule, cfg.level)
-    const decision = resolveEffortInjection({
-      supportsReasoning: capabilityFor.supportsReasoning,
-      requested,
-      seedEffort: seed.reasoningEffort,
-      recentCalls: calls,
+    const projection = readEffortProjection(ctx, session)
+    // Hysteresis is per session; a step without a session object (synthetic
+    // subagent step) shares one slot rather than losing the memo entirely.
+    const sessionKey = typeof session === 'object' && session !== null ? session : SESSIONLESS_AGENT_KEY
+    if (projection === undefined && !warnedSessions.has(sessionKey)) {
+      // Warn ONCE per session: a host line without the projection registry would
+      // otherwise emit this on every single request of the session.
+      warnedSessions.add(sessionKey)
+      ctx.logger?.warn?.(
+        '[auto-reasoning-effort] agent/request: difficulty projection unavailable on this host; using safeFallback=%s',
+        cfg.safeFallback,
+      )
+    }
+    const plan = decideRequestEffort({
+      projection,
+      configuredLevel: cfg.level,
+      difficulty: cfg.difficulty,
+      hysteresisSteps: cfg.hysteresisSteps,
+      safeFallback: cfg.safeFallback,
       allowDowngrade: cfg.allowDowngrade,
       allowUpgrade: cfg.allowUpgrade,
       efforts: capabilityFor.efforts,
-      toggleOnly: capabilityFor.toggleOnly,
+      previous: hysteresisBySession.get(sessionKey),
     })
+    if (plan.hysteresis !== undefined) hysteresisBySession.set(sessionKey, plan.hysteresis)
+
+    // The plan already picked and clamped the level; `resolveEffortInjection` is
+    // only the "may this model receive it at all" gate now — advertisement,
+    // `toggleOnly` folding and the no-reasoning strip. It is deliberately fed a
+    // CONCRETE level (never `auto`), so the upstream tool-history scheduler
+    // cannot run a second, different decision behind our back. `requested` is a
+    // plain string there, which is what lets a gateway's custom wire id
+    // (`ultra`) travel as the user's explicit pick.
+    const manualRequested = plan.requested
+    const decision: EffortInjectionDecision = manualRequested === undefined
+      ? { inject: false }
+      : resolveEffortInjection({
+        supportsReasoning: capabilityFor.supportsReasoning,
+        requested: manualRequested,
+        seedEffort: seed.reasoningEffort,
+        recentCalls: projection?.samples ?? [],
+        allowDowngrade: cfg.allowDowngrade,
+        allowUpgrade: cfg.allowUpgrade,
+        efforts: capabilityFor.efforts,
+        toggleOnly: capabilityFor.toggleOnly,
+      })
+
+    // Log/status fields: the classifier's own vocabulary, so a surprising level
+    // can be explained from the host log without re-running the turn.
+    const difficultyLabel = plan.result?.difficulty ?? (plan.fallback ? 'fallback' : 'manual')
+    const scoreLabel = plan.result === undefined ? '-' : plan.result.score.toFixed(2)
+    const reasonsLabel = plan.result === undefined || plan.result.reasons.length === 0
+      ? '-'
+      : plan.result.reasons.join(',')
+    const levelLabel = decision.inject ? String(decision.level) : 'none'
+    lastDecision = {
+      level: levelLabel,
+      difficulty: difficultyLabel,
+      score: plan.result?.score ?? 0,
+      reasons: plan.result?.reasons ?? [],
+      at: new Date().toISOString(),
+    }
+
     if (!decision.inject) {
-      // The model cannot take any effort: drop an inherited one so dsh does
-      // not reject the request (UNSUPPORTED_REASONING_EFFORT).
+      // The model cannot take any effort (or advertises none of the auto trio):
+      // drop an inherited one so dsh does not reject the request
+      // (UNSUPPORTED_REASONING_EFFORT).
       const stripped = { ...seed }
       delete (stripped as { reasoningEffort?: unknown }).reasoningEffort
       ctx.logger?.info?.(
-        '[thinking-levels] agent/request: model=%s/%s has no reasoning effort; stripped',
-        String(seed.provider), String(seed.model),
+        '[auto-reasoning-effort] agent/request: model=%s/%s user=%s seed=%s difficulty=%s score=%s reasons=%s src=%s => stripped',
+        String(seed.provider), String(seed.model), plan.intent,
+        String(seed.reasoningEffort), difficultyLabel, scoreLabel, reasonsLabel,
+        projection === undefined ? 'no-projection' : 'projection',
       )
       return stripped
     }
     // Summary-only log: individual tool names/arg sizes are workflow metadata
-    // that need not land in the host log; count and decision suffice. `user=`
-    // and `src=` make the runtime proof for issue #6 readable: a healthy
-    // session shows `src=projection`, `calls>0` after tool activity, and
-    // `user=auto` on every request after the first.
+    // that need not land in the host log; the counters and the decision suffice.
+    // `user=` is the ORIGINAL intent (`auto` when scheduling, the picked id
+    // otherwise), never the resolved level: a support log has to make "this
+    // request was scheduled" distinguishable from "the user locked a level".
     ctx.logger?.info?.(
-      '[thinking-levels] agent/request: model=%s/%s user=%s seed=%s calls=%d => level=%s src=%s',
-      String(seed.provider), String(seed.model), String(requested),
-      String(seed.reasoningEffort), calls.length, decision.level,
-      autoSchedule === undefined ? 'legacy' : 'projection',
+      '[auto-reasoning-effort] agent/request: model=%s/%s user=%s seed=%s difficulty=%s score=%s reasons=%s tools=%d errors=%d => level=%s src=%s',
+      String(seed.provider), String(seed.model), plan.intent,
+      String(seed.reasoningEffort), difficultyLabel, scoreLabel, reasonsLabel,
+      projection?.samples.length ?? 0, projection?.errors ?? 0, String(decision.level),
+      projection === undefined ? 'no-projection' : 'projection',
     )
     return { ...seed, reasoningEffort: decision.level }
   }, { prepend: true })
+
+  // Diagnostics: what the plugin is configured to do and what it decided last.
+  // Registered through the `tools` service with a hand-built definition (see
+  // `buildStatusTool`); a registry that rejects it must not poison the fiber —
+  // the injection path above is the product, this tool is an observability aid.
+  ;(ctx as unknown as {
+    inject?: (deps: string[], cb: (scope: {
+      tools?: { register?: (definition: unknown) => unknown }
+      effect?: (cleanup: () => void) => void
+    }) => void) => void
+  }).inject?.(['tools'], (scope) => {
+    if (typeof scope.tools?.register !== 'function') return
+    try {
+      const dispose = scope.tools.register(buildStatusTool(() => statusSnapshot(current(), lastDecision)))
+      if (typeof dispose === 'function') scope.effect?.(() => { (dispose as () => void)() })
+    } catch (error) {
+      ctx.logger?.warn?.(
+        '[auto-reasoning-effort] %s registration failed (diagnostic tool unavailable): %s',
+        STATUS_TOOL_NAME,
+        error instanceof Error ? error.message : String(error),
+      )
+    }
+  })
 
   // Advertise the `auto` mask (and, for configurer-confirmed rc.6-era models,
   // `low`) in the model directory so the session model selector offers them

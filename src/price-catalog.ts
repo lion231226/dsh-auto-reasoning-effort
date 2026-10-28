@@ -23,7 +23,7 @@
  * estimate = 典型价兜底估算，source 记 'catalog-miss' 且 estimated=true；
  * off 才是真不计价）。节假日/补班修正表随 isPeakBeijing 一并迁入，
  * billing-projection 只负责记账，不再持有价格与日历。
- * @module dsh-thinking-levels/price-catalog
+ * @module dsh-auto-reasoning-effort/price-catalog
  */
 
 /** 币种：目录原样，不折算。 */

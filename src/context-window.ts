@@ -1,5 +1,5 @@
 /**
- * Pure context-window helpers for the dsh-thinking-levels plugin.
+ * Pure context-window helpers for the dsh-auto-reasoning-effort plugin.
  *
  * The context-window limit of a custom gateway model is declared in the
  * llm-pi-ai model entry (`contextWindow`, a positive integer). The harness

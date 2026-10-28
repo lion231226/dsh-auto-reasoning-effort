@@ -12,7 +12,7 @@
  * the owning plugin's Config schema declares survive the round trip; the
  * `revision` is the write fence `settings.update(ns, patch, expectedRevision)`
  * accepts.
- * @module dsh-thinking-levels/settings-read
+ * @module dsh-auto-reasoning-effort/settings-read
  */
 import type { Context } from '@deepseek-ai/cordis'
 

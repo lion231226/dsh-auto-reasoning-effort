@@ -1,5 +1,5 @@
 /**
- * Pure thinking-level decision for the dsh-thinking-levels plugin.
+ * Pure thinking-level decision for dsh-auto-reasoning-effort.
  *
  * The measured bottleneck of tool calls in dsh is the model's THINKING phase
  * (~90% of the wall-clock time for simple tasks), not the tool execution
@@ -18,8 +18,18 @@
  *   gradients. Each maps to a wire value via the model's `reasoningEfforts`
  *   table (customizable per model — e.g. `high` → `ultra`); levels the model
  *   does not advertise are clamped to its highest thinking level or stripped.
- * - `auto`    : schedule per step from the recent tool-call history, between
- *               `low` / `high` / `max` (never `off`, never `auto` itself).
+ * - `auto`    : schedule per request from the turn's DIFFICULTY (the user's
+ *               message) plus its tool history, between `low` / `high` / `max`
+ *               (never `off`, never `auto` itself).
+ *
+ * The scheduling policy lives here in three pure pieces so it stays testable
+ * without a host:
+ * - {@link baseEffortFor} maps a difficulty bucket onto a base level;
+ * - {@link decideEffort} applies the tool-history fine-tuning on top;
+ * - {@link applyHysteresis} damps level flapping across consecutive requests;
+ * - {@link clampForAuto} projects the result onto the levels the model really
+ *   advertises, preferring DOWNWARD moves (upstream clamped upward, which is
+ *   the wrong direction for a cost-saving feature).
  *
  * A request-level guard decides whether an effort may be injected at all:
  * models that do not advertise reasoning metadata (custom openai-completions
@@ -31,11 +41,26 @@
  * in isolation; the plugin host feeds it the live session's recent calls.
  */
 
+import type { Difficulty } from './difficulty.ts'
+
 /** The user-facing thinking levels: the eight standard levels plus the scheduler sentinel. */
 export type EffortId = 'off' | 'on' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'auto'
 
 /** Wire levels the auto scheduler may pick (never `off`, never `auto`). */
 export type AutoEffort = 'low' | 'high' | 'max'
+
+/**
+ * What {@link decideEffort} may return: the auto trio, plus the manual strength
+ * gradient when it is passed through untouched.
+ *
+ * The manual gradient is deliberately NOT folded into `low`/`high` here: a
+ * user who picked `medium` or `xhigh` on a gateway that advertises it must keep
+ * that exact wire value, and only the caller knows whether the model takes it.
+ */
+export type DecidedEffort = Exclude<EffortId, 'off' | 'on' | 'auto'>
+
+/** The three auto levels ordered weakest → strongest; the axis `clampForAuto` walks. */
+const AUTO_LADDER: readonly AutoEffort[] = ['low', 'high', 'max'] as const
 
 /** The eight standard levels (excluding the `auto` scheduler sentinel). */
 export const STANDARD_LEVELS: readonly EffortId[] = [
@@ -61,90 +86,219 @@ export function assertEffortId(value: unknown, where: string): asserts value is 
   }
 }
 
-/** One observed tool call of the current/last step. */
+/** One observed tool call of the current turn. */
 export interface ToolCallSample {
-  /** Tool name, e.g. 'bash', 'fs_write', 'web_search', 'mcp__...'. */
+  /** Tool name, e.g. 'bash', 'fs_write', 'pwsh', 'mcp__...'. */
   name: string
   /** Approximate argument size in characters (payload heft). */
   argsSize: number
+  /**
+   * 1-based conversation turn the call belongs to. The projection filters on
+   * it so a new prompt starts from an empty window instead of inheriting the
+   * previous turn's history (upstream kept one ring across the whole session).
+   */
+  turn: number
+  /** 1-based step within that turn (one model request = one step). */
+  step: number
 }
 
 /**
- * Everything the policy needs to decide one request's level.
+ * Tool names that are cheap to reason about: plain file/interpreter plumbing.
+ *
+ * Windows hosts surface `pwsh`, `shell` and `powershell` where POSIX hosts say
+ * `bash`, and dsh's own editor uses `apply_patch` — omitting either family
+ * would make the downgrade path unreachable on half the supported hosts.
+ * Anchored on a delimiter so look-alikes are not misread: `code` matches
+ * `code_read` but not `codebase_search`, `job` matches `job_status` but not
+ * `jobs_board`. Kept exported so the rule can be asserted directly.
  */
-export interface EffortDecisionInput {
-  /** Recent tool calls of the step (oldest first); empty for a fresh prompt. */
-  recentCalls: readonly ToolCallSample[]
-  /** The user-selected level: a fixed wire level, or `auto` for scheduling. */
-  selected: EffortId
-  /** Scheduler preference: allow the scheduler to drop below the hub (`high`). */
-  allowDowngrade: boolean
-  /** User preference: allow the scheduler to lift above the hub to `max`. */
-  allowUpgrade: boolean
-}
+export const SIMPLE_TOOL_RE = /^(?:fs|bash|terminal|pwsh|shell|powershell|code|text|todo|job|skill|read|list|search|write|grep|glob|edit|ls|cat|rm|mv|cp|touch|mkdir|pwd|head|tail|apply_patch)(?:_|$)/i
 
-/** Deterministic tool names that are cheap to reason about (word-boundary anchored). */
-const SIMPLE_TOOL_RE = /^(?:fs|bash|terminal|code|text|todo|job|skill|read|list|search|write|grep|glob|edit|ls|cat|rm|mv|cp|touch|mkdir|pwd|head|tail)(?:_|$)/i
+/** Above this argument size even a "simple" tool call is real work. */
+const SIMPLE_ARGS_LIMIT = 800
 
-/** Hefty payloads signal non-trivial work no matter the tool name. */
-const HEAVY_ARGS = 800
-
-/** Count how many of the recent calls look cheap-and-deterministic. */
-function simpleRatio(calls: readonly ToolCallSample[]): number {
-  if (calls.length === 0) return 1
-  const simple = calls.filter(call =>
-    SIMPLE_TOOL_RE.test(call.name) && call.argsSize < HEAVY_ARGS,
-  ).length
-  return simple / calls.length
-}
+/** A single payload this large means the model is digesting/writing a lot. */
+const HEAVY_ARGS_LIMIT = 3200
 
 /**
- * Auto schedule: map a recent tool-call history to the wire level the NEXT
- * model request of that step should use.
+ * Minimum samples before tool history may move the level.
  *
- * Hub is `high` (the official default). Rules:
- * - No tool calls yet (fresh prompt, pure chat) -> `low` (simple chat tasks).
- * - All/mostly simple tools -> `low` (when downgrades are allowed).
- * - Mixed or heavy tools -> `high` (the hub).
- * - Very heavy context (huge args) -> `max` (when upgrades are allowed).
- *
- * The scheduler MAY pick `low`: the request-level capability guard strips any
- * effort from models that do not support it, so a scheduled `low` only ever
- * reaches models that advertise the level.
- *
- * @param calls - recent tool calls of the step.
- * @param allowDowngrade - may drop below `high`.
- * @param allowUpgrade - may lift above `high`.
- * @returns a wire level; never `off` (off is manual-only) and never `auto`.
+ * One call is noise: the first tool of a turn is almost always a cheap probe,
+ * and letting it downgrade the whole turn reintroduces the "everything is
+ * simple" defect the difficulty signal was added to fix.
  */
-function scheduleEffort(
-  calls: readonly ToolCallSample[],
-  allowDowngrade: boolean,
-  allowUpgrade: boolean,
-): AutoEffort {
-  if (calls.length === 0) return allowDowngrade ? 'low' : 'high'
+const MIN_TUNE_SAMPLES = 2
 
-  const ratio = simpleRatio(calls)
-  const heaviest = calls.reduce((max, call) => Math.max(max, call.argsSize), 0)
-
-  if (ratio >= 0.75 && allowDowngrade) return 'low'
-  if (heaviest >= HEAVY_ARGS * 4 && allowUpgrade) return 'max'
+/**
+ * Base level a difficulty bucket asks for, before tool history is considered.
+ *
+ * `explicit` never reaches this function in production — the caller overrides
+ * with the level the user typed, because a text override is a manual choice.
+ * It is mapped to `high` here only so the mapping stays total: a future caller
+ * that forgets to branch gets the hub level rather than `undefined`.
+ *
+ * @param difficulty - the bucket from {@link classifyDifficulty}.
+ * @param allowUpgrade - whether `max` is allowed (user preference).
+ * @returns the base auto level.
+ */
+export function baseEffortFor(difficulty: Difficulty, allowUpgrade: boolean): AutoEffort {
+  if (difficulty === 'trivial' || difficulty === 'simple') return 'low'
+  if (difficulty === 'moderate') return 'high'
+  if (difficulty === 'complex') return allowUpgrade ? 'max' : 'high'
   return 'high'
 }
 
+/** Everything the scheduler needs to decide one request's level. */
+export interface DecideEffortInput {
+  /** The user-selected level: a fixed wire level, or `auto` for scheduling. */
+  selected: EffortId
+  /**
+   * Level asked for in the user's message (`[effort: max]`), already mapped
+   * from the classifier's `explicit`. `off` is not accepted: it would turn the
+   * scheduler into a manual off switch, which the host handles itself.
+   */
+  explicit?: AutoEffort
+  /** Difficulty of this turn (from {@link classifyDifficulty}). */
+  difficulty: Difficulty
+  /** Tool samples of THIS turn, oldest first (may be empty). */
+  recentCalls: readonly ToolCallSample[]
+  /** Scheduler preference: may drop below `high`. */
+  allowDowngrade: boolean
+  /** User preference: may lift above `high` to `max`. */
+  allowUpgrade: boolean
+}
+
 /**
- * Map the user's selected level to the level injected into the next
- * `agent/request`. Manual levels (off / low / high / max) pass through
- * unchanged — `low` is the manual pick for simple chat tasks. `auto`
- * delegates to the tool-history scheduler.
+ * Decide the wire level for the next model request.
  *
- * @param input - recent calls, the selected level and the user's toggles.
- * @returns The level to inject; `auto` is resolved before returning.
+ * Rules, in order:
+ * 1. An explicit in-message request wins — the user typed it for this turn.
+ * 2. A manual selection wins over everything else: `off` / `on` are not wire
+ *    levels, so both map to `high` (thinking enabled at the hub); the strength
+ *    gradient is returned untouched and left to the caller's clamp.
+ * 3. `auto`: start from the difficulty base, then let tool history nudge it.
+ *    Fine-tuning needs at least two samples; heavy payloads lift to `max`
+ *    before simple payloads may drop to `low` (heavy wins a tie).
+ *
+ * The result is never `off` and never `auto`.
+ *
+ * @param input - selection, difficulty, tool samples and the user toggles.
+ * @returns the level to inject (before the capability clamp).
  */
-export function decideEffort(input: EffortDecisionInput): EffortId {
-  const { recentCalls, selected, allowDowngrade, allowUpgrade } = input
-  if (selected !== 'auto') return selected
-  return scheduleEffort(recentCalls, allowDowngrade, allowUpgrade)
+export function decideEffort(input: DecideEffortInput): DecidedEffort {
+  const { selected, explicit, difficulty, recentCalls, allowDowngrade, allowUpgrade } = input
+  if (explicit !== undefined) return explicit
+  if (selected !== 'auto') {
+    if (selected === 'off' || selected === 'on') return 'high'
+    // A manual gradient pick (`low` / `medium` / `xhigh` / `max`) passes
+    // through: the caller's clamp decides whether the model can take it.
+    // Collapsing `medium` to `high` here would silently drop the user's pick.
+    return selected
+  }
+
+  const base = baseEffortFor(difficulty, allowUpgrade)
+  if (recentCalls.length < MIN_TUNE_SAMPLES) return base
+
+  let simpleCount = 0
+  let heaviest = 0
+  for (const call of recentCalls) {
+    if (SIMPLE_TOOL_RE.test(call.name) && call.argsSize < SIMPLE_ARGS_LIMIT) simpleCount += 1
+    if (call.argsSize > heaviest) heaviest = call.argsSize
+  }
+
+  // Heavy first: a turn that just produced a 4 KB payload is not "simple"
+  // even if most of its calls were listings.
+  if (heaviest >= HEAVY_ARGS_LIMIT && allowUpgrade) return 'max'
+  if (simpleCount / recentCalls.length >= 0.75 && allowDowngrade && base === 'high') return 'low'
+  return base
+}
+
+/** Per-session hysteresis memo: the level in force and any pending candidate. */
+export interface HysteresisState {
+  /** The level currently in force (what the next request keeps using). */
+  level: AutoEffort
+  /** Candidate waiting to take over; null when there is no candidate. */
+  pending: AutoEffort | null
+  /** How many consecutive requests have proposed {@link pending}. */
+  pendingCount: number
+}
+
+/**
+ * Damp level flapping between consecutive requests.
+ *
+ * A single anomalous tool call (one `web_search` in a mostly-cheap turn) used
+ * to flip the level for exactly one request and back — the model then paid the
+ * higher level once and the user saw the slider jump. A candidate must be
+ * proposed on `steps` CONSECUTIVE requests before it takes over.
+ *
+ * The candidate is tracked explicitly (rather than with a single streak
+ * counter) for two reasons:
+ * - a decision that agrees with the current level CANCELS the candidate, so
+ *   alternating H, L, H, L never switches — a plain counter would keep
+ *   accumulating and eventually cross the threshold;
+ * - the counter belongs to the candidate, not to the session, so ten stable
+ *   requests do not prime a switch that one different request could trigger.
+ *
+ * `steps <= 1` degenerates to "the first different decision wins", i.e. no
+ * hysteresis.
+ *
+ * @param previous - memo from the previous request, or undefined on the first one.
+ * @param next - the decision for this request (from {@link decideEffort}).
+ * @param steps - how many consecutive proposals a candidate needs to take over.
+ * @returns the memo to store for the next request; its `level` is what to use.
+ */
+export function applyHysteresis(
+  previous: HysteresisState | undefined,
+  next: AutoEffort,
+  steps: number,
+): HysteresisState {
+  // First request of a session: adopt immediately. Waiting `steps` requests to
+  // pick a level would leave the first one unscheduled (upstream's hub).
+  if (previous === undefined) return { level: next, pending: null, pendingCount: 0 }
+  // Agreeing with the level in force clears any candidate: a proposal that was
+  // interrupted is not "almost adopted".
+  if (next === previous.level) return { level: next, pending: null, pendingCount: 0 }
+
+  // A candidate for a different level counts only its own consecutive run; a
+  // proposal for yet another level restarts the count at 1.
+  const pendingCount = previous.pending === next ? previous.pendingCount + 1 : 1
+  if (pendingCount >= steps) return { level: next, pending: null, pendingCount: 0 }
+  return { level: previous.level, pending: next, pendingCount }
+}
+
+/**
+ * Project an auto level onto the levels the model actually advertises.
+ *
+ * The adapter rejects unadvertised values per request
+ * (UNSUPPORTED_REASONING_EFFORT), so a scheduled level has to be remapped.
+ * Upstream `clampToEfforts` always took the model's HIGHEST level, which turns
+ * a scheduled `low` on an off/high model into `high` — acceptable — but turns
+ * `low` on an off/high/max model into `max`, i.e. the cost-saving feature
+ * silently buys the most expensive level. This walks the ladder DOWNWARD from
+ * the requested level first and only then upward.
+ *
+ * @param level - the scheduled level.
+ * @param efforts - the model's advertised effort ids (any order).
+ * @returns the level to inject, or `undefined` when no auto level is offered
+ *   (the caller then strips `reasoningEffort` entirely).
+ */
+export function clampForAuto(level: AutoEffort, efforts: readonly string[]): EffortId | undefined {
+  if (efforts.includes(level)) return level
+  const index = AUTO_LADDER.indexOf(level)
+  for (let lower = index - 1; lower >= 0; lower -= 1) {
+    const candidate = AUTO_LADDER[lower]
+    if (efforts.includes(candidate)) return candidate
+  }
+  for (let higher = index + 1; higher < AUTO_LADDER.length; higher += 1) {
+    const candidate = AUTO_LADDER[higher]
+    if (efforts.includes(candidate)) return candidate
+  }
+  return undefined
+}
+
+/** Narrow a decided level onto the auto trio, for the clamp's type. */
+function isAutoEffort(level: DecidedEffort): level is AutoEffort {
+  return level === 'low' || level === 'high' || level === 'max'
 }
 
 /**
@@ -170,13 +324,19 @@ export interface EffortInjectionInput {
    * The level this request was ASKED for: the session's explicit pick (folded
    * from `model/selection`) when present, else the plugin-configured default.
    *
+   * Typed `string`, not `EffortId`: a session pick may be a gateway's own wire
+   * value (`ultra`) that this plugin does not enumerate, and such an id must be
+   * treated as an explicit choice — passed through when the model advertises
+   * it, stripped when it does not, never handed to the scheduler. A narrow
+   * `EffortId` here forced the call site into a lying cast.
+   *
    * Never derive this from the request seed. From dsh 0.1.2-rc.1 on, the host
    * seeds `reasoningEffort` from the previous `request/header` — which is this
    * plugin's own output (`core/agent-loop/src/agent.ts:573-581`). Reading it as
    * a manual pick made `auto` resolve once and then stay frozen for the rest of
    * the session (issue #6, bug 2).
    */
-  requested: EffortId
+  requested: string
   /**
    * The `reasoningEffort` already present on the request seed (host echo of a
    * previous header, or route inheritance). Used ONLY to recognise the `on`
@@ -184,11 +344,11 @@ export interface EffortInjectionInput {
    * never as a manual-pick signal.
    */
   seedEffort: unknown
-  /** Recent tool calls of the step, for the auto scheduler. */
+  /** Tool samples of the current turn, for the auto scheduler. */
   recentCalls: readonly ToolCallSample[]
   /** Scheduler preference: allow the scheduler to drop below `high`. */
   allowDowngrade: boolean
-  /** Scheduler preference: allow lifting above `high` to `max`. */
+  /** User preference: allow lifting above `high` to `max`. */
   allowUpgrade: boolean
   /** The model's advertised effort ids (including plugin masks like `auto`). */
   efforts: readonly string[]
@@ -199,34 +359,39 @@ export interface EffortInjectionInput {
    * level (pi-ai serializes it as enable_thinking, no reasoning_effort).
    */
   toggleOnly: boolean
+  /**
+   * Difficulty of this turn, used by the auto branch. Defaults to `moderate`
+   * (the hub) so an older call site that does not pass it keeps the previous
+   * "stay at high unless the user chose otherwise" behaviour.
+   */
+  difficulty?: Difficulty
+  /**
+   * In-message request (`[effort: high]`), `off` excluded. Treated like a
+   * manual pick: an exact request, passed through when advertised and stripped
+   * when not — never clamped to a different strength.
+   */
+  explicit?: AutoEffort
+  /**
+   * A level the caller already decided (it ran {@link decideEffort} and
+   * {@link applyHysteresis} itself, because the hysteresis memo is per session
+   * and this function is stateless). When present the auto branch uses it
+   * instead of scheduling again, so the two never disagree.
+   */
+  autoLevel?: AutoEffort
 }
 
 /** The resolved action for one `agent/request`. */
 export interface EffortInjectionDecision {
   /** Keep/inject a `reasoningEffort` on the request (false = strip it). */
   inject: boolean
-  /** The wire level to set, present when `inject` is true. */
-  level?: EffortId
-}
-
-/**
- * Clamp a level to the ones the model actually advertises. The adapter rejects
- * any other value per request (UNSUPPORTED_REASONING_EFFORT), so an unsupported
- * scheduled level is lifted to the model's highest advertised thinking level
- * (a toggle-only model advertises off/high → a scheduled low becomes `high`,
- * which enables thinking without sending a think effort), and a model
- * advertising no thinking level at all yields nothing (strip).
- * @param level - the scheduled or manually selected level.
- * @param efforts - the model's advertised effort ids (escalation-ordered).
- * @returns the level to inject, or `undefined` when the model cannot take it.
- */
-export function clampToEfforts(level: EffortId, efforts: readonly string[]): EffortId | undefined {
-  if (efforts.includes(level)) return level
-  // off and auto are not thinking levels; the advertised list is
-  // escalation-ordered.
-  const thinking = efforts.filter(id => id !== 'off' && id !== 'auto')
-  if (thinking.length === 0) return undefined
-  return thinking[thinking.length - 1] as EffortId
+  /**
+   * The wire value to set, present when `inject` is true.
+   *
+   * `string` rather than `EffortId`: a manual session pick may be a gateway's
+   * custom id (`ultra`) that the plugin does not enumerate, and it must reach
+   * the request unchanged when the model advertises it.
+   */
+  level?: string
 }
 
 /**
@@ -242,9 +407,11 @@ export function clampToEfforts(level: EffortId, efforts: readonly string[]): Eff
  *   model it injects the advertised thinking level (`high`), which the wire
  *   serializes as enable_thinking without a reasoning_effort; an
  *   effort-capable model does not advertise `on`, so it is stripped.
- * - `auto` resolves through the scheduler; the result is clamped to the
- *   model's advertised levels, so a scheduled `low` on a model that only takes
- *   off/high (Qwen3.6) becomes `high` instead of an error.
+ * - `auto` resolves through the difficulty-aware scheduler; the result is
+ *   clamped DOWNWARD-first to the model's advertised levels, so a scheduled
+ *   `low` on a model that only takes off/high (Qwen3.6) becomes `high`, while
+ *   a scheduled `low` on an off/low/high/max model stays `low` instead of
+ *   being lifted to `max`.
  *
  * The manual/auto branch reads `requested` only. The seed no longer influences
  * it, so a header echoed back by the host cannot masquerade as a user pick.
@@ -278,13 +445,23 @@ export function resolveEffortInjection(input: EffortInjectionInput): EffortInjec
       ? { inject: true, level: requested }
       : { inject: false }
   }
-  const level = decideEffort({
-    recentCalls: input.recentCalls,
+  if (input.explicit !== undefined) {
+    // The message itself asked for a level: same contract as a manual pick —
+    // exact when advertised, stripped when not.
+    return efforts.includes(input.explicit)
+      ? { inject: true, level: input.explicit }
+      : { inject: false }
+  }
+  const scheduled = input.autoLevel ?? decideEffort({
     selected: 'auto',
+    difficulty: input.difficulty ?? 'moderate',
+    recentCalls: input.recentCalls,
     allowDowngrade: input.allowDowngrade,
     allowUpgrade: input.allowUpgrade,
   })
-  const clamped = clampToEfforts(level, efforts)
+  // A scheduled level is always one of the trio; the guard only satisfies the
+  // type system (the wider `DecidedEffort` exists for the manual passthrough).
+  const clamped = isAutoEffort(scheduled) ? clampForAuto(scheduled, efforts) : undefined
   return clamped === undefined ? { inject: false } : { inject: true, level: clamped }
 }
 

@@ -1,5 +1,5 @@
 /**
- * Auto-flag sync (check branch): bridge from dsh-thinking-levels to the
+ * Auto-flag sync (check branch): bridge from dsh-auto-reasoning-effort to the
  * OFFICIAL llm-pi-ai compat surface.
  *
  * CHECK-BRANCH REPLACEMENT: the previous bridge maintained the
@@ -28,7 +28,7 @@
  * Deliberately soft-coupled: nothing here value-imports dsh-settings. If the
  * installed dsh predates rc.8 the schema rejects the unknown field and the
  * host catches and logs the rejection — no error, no log spam.
- * @module dsh-thinking-levels/takeover-sync
+ * @module dsh-auto-reasoning-effort/takeover-sync
  */
 
 /** The settings namespace holding the provider/model configs (llm-pi-ai). */
