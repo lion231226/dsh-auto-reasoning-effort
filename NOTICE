@@ -1,0 +1,52 @@
+NOTICE
+======
+
+dsh-auto-reasoning-effort
+Copyright (c) 2026 lion231226
+
+This project is a fork of dsh-thinking-levels 4.4.8 by drscrewdriver
+(https://github.com/drscrewdriver/dsh-thinking-levels), distributed under the
+MIT License. The upstream copyright notice is preserved in LICENSE; the
+upstream-permission text is unchanged.
+
+Split of authorship
+-------------------
+
+Upstream (c) 2026 drscrewdriver, MIT — the plugin host wiring, the client UI
+half (model-panel card, effort slider, family tab, context ring), the
+settings/volatile-config plumbing, the session projection scaffolding, the
+billing/pricing helpers, and the build layout.
+
+Added or substantially rewritten in this fork (c) 2026 lion231226:
+
+  * difficulty classification from the current user prompt
+    (src/difficulty.ts — length buckets, keyword classes, structural signals,
+    difficulty bands, difficulty-to-effort mapping);
+  * turn isolation of tool samples (per-turn window instead of a session-wide
+    ring buffer);
+  * a safety-directed fallback (projection or parse failure falls back to
+    `high`, configurable through `safeFallback`);
+  * nearest-lower clamping for the auto path (never "jump to the highest
+    advertised level");
+  * decision hysteresis (`hysteresisSteps`) so consecutive identical decisions
+    are required before the wire level moves;
+  * Windows tool-name coverage in the simple-tool matcher (`pwsh`, `shell`,
+    `powershell`, `apply_patch`);
+  * preservation of custom wire ids selected by the user (e.g. `ultra`);
+  * explainable decisions: every scheduling decision records `reasons[]`.
+
+Bundled artwork attribution
+---------------------------
+
+src/client/whale-mascot.ts inlines a whale-girl runner strip as a base64 PNG
+data URL. The strip derives from community artwork published in
+HanaAyane/dsh-reasoning-effort and is retained here with attribution; the
+generator script tools/whale-mascot.py reproduces the inlined asset from
+tools/chibi-runner-strip.png. This artwork is not part of the MIT-licensed
+code contributions described above.
+
+Third-party dependencies
+------------------------
+
+Runtime dependencies keep their own licenses: @deepseek-ai/schemastery and
+zod (see the package metadata bundled with each).

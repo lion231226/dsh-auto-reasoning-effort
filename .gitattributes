@@ -1,0 +1,6 @@
+# Normalize line endings so the published tarball and CI builds are identical
+# on every platform.
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.tgz binary

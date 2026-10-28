@@ -1,5 +1,5 @@
 /**
- * Independent tsdown preset for the dsh-thinking-levels client half, mirroring
+ * Independent tsdown preset for the dsh-auto-reasoning-effort client half, mirroring
  * deepseek-harness/packages/client/tsdown.client.ts semantics:
  *
  * - browser half: src/client/index.ts -> lib/client.js (CJS, browser) with the
@@ -7,15 +7,15 @@
  *   table. The node half stays on plain `tsc` (lib/index.js + .d.ts).
  *
  * The browser bundle is served by dsh-client-modules at
- * /plugins/dsh-thinking-levels/client.js; every @deepseek-ai/* value import
+ * /plugins/dsh-auto-reasoning-effort/client.js; every @deepseek-ai/* value import
  * must be a platform module (external) or an inline-safe wire layer — this
  * client half only type-imports @deepseek-ai/* packages (erased before the
  * gate), and the purity gate below enforces that.
  */
 import type { UserConfig } from 'tsdown'
 
-/** Plugin id stamped into the loader handoff. */
-const PLUGIN_ID = 'dsh-thinking-levels'
+/** Plugin id stamped into the loader handoff (must match the installed package name). */
+const PLUGIN_ID = 'dsh-auto-reasoning-effort'
 
 /** The module specifiers the shell shares into the frozen module table. */
 const PLATFORM_MODULES = [

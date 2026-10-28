@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Auto Reasoning Effort",
+    "description": "Task-difficulty-driven reasoning effort: schedules low / high / max per request from the prompt and this turn's tool signals."
+  }
+}

@@ -1,16 +1,33 @@
 {
-  "name": "dsh-thinking-levels",
-  "version": "4.4.8",
-  "publishConfig": {
-    "registry": "https://registry.npmjs.org",
-    "access": "public",
-    "tag": "dsh-0.2.0"
-  },
-  "description": "DSH host plugin: thinking-level (reasoning_effort) control for dsh — auto-adjust per tool round, with optional manual lock and per-tool timing telemetry.",
+  "name": "dsh-auto-reasoning-effort",
+  "version": "0.1.0",
+  "description": "Difficulty-driven reasoning-effort scheduler for DeepSeek Harness (dsh) — picks low / high / max per request from the task's difficulty instead of a fixed wire level. 按任务难度实时调节推理档位的 DSH 插件。",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/drscrewdriver/dsh-thinking-levels.git"
+    "url": "git+https://github.com/lion231226/dsh-auto-reasoning-effort.git"
   },
+  "homepage": "https://github.com/lion231226/dsh-auto-reasoning-effort#readme",
+  "bugs": {
+    "url": "https://github.com/lion231226/dsh-auto-reasoning-effort/issues"
+  },
+  "author": "lion231226",
+  "license": "MIT",
+  "icon": "./icon.svg",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "reasoning-effort",
+    "task-difficulty",
+    "thinking-levels",
+    "auto",
+    "deepseek"
+  ],
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org",
+    "access": "public"
+  },
+  "packageManager": "pnpm@11.7.0",
   "type": "module",
   "files": [
     "lib",
@@ -18,30 +35,13 @@
     "dsh.plugin.json",
     "README.md",
     "README.zh.md",
-    "README.ja.md",
-    "README.ko.md",
-    "README.fr.md",
-    "README.de.md",
-    "README.it.md",
-    "README.ru.md",
-    "README.es.md",
     "INSTALL.md",
     "INSTALL.zh.md",
-    "INSTALL.ja.md",
-    "INSTALL.ko.md",
-    "INSTALL.fr.md",
-    "INSTALL.de.md",
-    "INSTALL.it.md",
-    "INSTALL.ru.md",
-    "INSTALL.es.md",
     "CHANGELOG.md",
-    "CHANGELOG.ja.md",
-    "CHANGELOG.ko.md",
-    "CHANGELOG.fr.md",
-    "CHANGELOG.de.md",
-    "CHANGELOG.it.md",
-    "CHANGELOG.ru.md",
-    "CHANGELOG.es.md"
+    "LICENSE",
+    "NOTICE",
+    "icon.svg",
+    "locale"
   ],
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
@@ -54,9 +54,14 @@
       "types": "./lib/thinking-level.d.ts",
       "default": "./lib/thinking-level.js"
     },
+    "./difficulty": {
+      "types": "./lib/difficulty.d.ts",
+      "default": "./lib/difficulty.js"
+    },
     "./client": {
       "default": "./lib/client.js"
     },
+    "./locale/*.json": "./locale/*.json",
     "./package.json": "./package.json"
   },
   "engines": {
@@ -64,7 +69,8 @@
     "dsh": "0.1.0-rc.8 || 0.1.1-rc.1 || 0.1.1-rc.2 || 0.1.2-rc.1 || 0.1.5-rc.1 || 0.1.5-rc.2 || 0.1.5-rc.3 || 0.1.7-rc.1 || 0.1.7-rc.2 || 0.2.0-rc.1 || 0.2.0-rc.2 || 0.2.1-rc.1 || 0.2.1-rc.2 || 0.2.1-rc.3"
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/schemastery": "^3.18.2",
     "@deepseek-ai/dsh-api-remotes": "0.1.0-rc.8 || 0.1.1-rc.1 || 0.1.1-rc.2 || 0.1.2-rc.1 || 0.1.5-rc.1 || 0.1.5-rc.2 || 0.1.5-rc.3 || 0.1.7-rc.1 || 0.1.7-rc.2 || 0.2.0-rc.1 || 0.2.0-rc.2 || 0.2.1-rc.1 || 0.2.1-rc.2 || 0.2.1-rc.3",
     "@deepseek-ai/dsh-api-session-controller": "0.1.0-rc.8 || 0.1.1-rc.1 || 0.1.1-rc.2 || 0.1.2-rc.1 || 0.1.5-rc.1 || 0.1.5-rc.2 || 0.1.5-rc.3 || 0.1.7-rc.1 || 0.1.7-rc.2 || 0.2.0-rc.1 || 0.2.0-rc.2 || 0.2.1-rc.1 || 0.2.1-rc.2 || 0.2.1-rc.3",
     "@deepseek-ai/dsh-client-locale": "0.1.0-rc.8 || 0.1.1-rc.1 || 0.1.1-rc.2 || 0.1.2-rc.1 || 0.1.5-rc.1 || 0.1.5-rc.2 || 0.1.5-rc.3 || 0.1.7-rc.1 || 0.1.7-rc.2 || 0.2.0-rc.1 || 0.2.0-rc.2 || 0.2.1-rc.1 || 0.2.1-rc.2 || 0.2.1-rc.3",
@@ -122,14 +128,14 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json && tsdown",
+    "prepare": "npm run build",
     "prepack": "npm run build",
     "prepublishOnly": "npm run build",
-    "release:4x": "npm publish --tag dsh-0.2.0 --registry=https://registry.npmjs.org",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src tests",
-    "test": "vitest run"
+    "test": "vitest run",
+    "release": "npm publish --registry=https://registry.npmjs.org"
   },
-  "license": "MIT",
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"

@@ -1,4 +1,7 @@
 node_modules/
+lib/
 dist/
 _wt-audit/
 *.tgz
+*.tsbuildinfo
+.eslintcache

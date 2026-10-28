@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "难度自适应推理档位",
+    "description": "按任务难度自动调节推理档位：依据本轮 prompt 与工具信号，逐次在 low / high / max 之间调度。"
+  }
+}

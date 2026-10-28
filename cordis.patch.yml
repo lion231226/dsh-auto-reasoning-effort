@@ -1,3 +1,6 @@
+# dsh-auto-reasoning-effort bundle layer: register the plugin as a bundle row.
+# `id` is the stable row identifier later layers override; `name` resolves the
+# module through the installed package (package.json#main).
 - insert:
-    - id: dsh-thinking-levels
-      name: dsh-thinking-levels
+    - id: dsh-auto-reasoning-effort
+      name: dsh-auto-reasoning-effort
